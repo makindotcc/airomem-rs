@@ -72,8 +72,10 @@ where
         Ok(())
     }
 
-    pub async fn query(&self) -> Query<'_, T> {
-        Query(self.inner.read().await)
+    /// Returns immutable, read only store data.
+    /// While [QueryGuard] is not dropped, any store updates are locked.
+    pub async fn query(&self) -> QueryGuard<'_, T> {
+        QueryGuard(self.inner.read().await)
     }
 
     async fn rebuild(&mut self, persistence_actions: Vec<PersistenceAction>) -> StoreResult<()> {
@@ -174,9 +176,9 @@ impl<T> StoreInner<T> {
     }
 }
 
-pub struct Query<'a, T>(RwLockReadGuard<'a, StoreInner<T>>);
+pub struct QueryGuard<'a, T>(RwLockReadGuard<'a, StoreInner<T>>);
 
-impl<'a, T> Deref for Query<'a, T> {
+impl<'a, T> Deref for QueryGuard<'a, T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
