@@ -204,6 +204,8 @@ where
             Err(err) if err.is_eof() => {
                 // ignore partially saved entry, but
                 // is eof always equal to interrupted write?
+                // todo:
+                // return error for half-written command and give option to api to handle it
                 Ok(None)
             }
             Err(err) => Err(err),

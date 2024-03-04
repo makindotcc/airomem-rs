@@ -2,6 +2,10 @@
 name = "airomem"
 version = "0.1.0"
 edition = "2021"
+repository = ""
+categories = ["database-implementations"]
+description = "Simple persistence library inspired by Prevayler and @jarekratajski"
+license = "MIT"
 
 [dependencies]
 tokio = { version = "1", features = ["fs", "io-util", "macros", "rt-multi-thread"] }
