@@ -15,7 +15,7 @@
 
 - [x] - saving executed commands to append only file
 - [x] - split journal log file if too big - while restoring data, all journal logs are loaded at once from disk to maximise throughput (and for simplicity reasons)
-- [ ] - snapshots for faster recovery
+- [x] - snapshots for faster recovery
 
 ## Resources
 

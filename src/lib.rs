@@ -25,44 +25,44 @@ where
 impl<T, S, C> Store<T, S>
 where
     T: State<Command = C>,
+    S: Serializer<T> + Serializer<C>,
 {
     pub async fn open(
         serializer: S,
         options: StoreOptions,
         dir: impl Into<PathBuf>,
-    ) -> StoreResult<Self>
-    where
-        S: Serializer<T> + Serializer<C>,
-    {
+    ) -> StoreResult<Self> {
         let dir: PathBuf = dir.into();
         fs::create_dir_all(&dir).await.map_err(StoreError::FileIO)?;
-        let old_journals = JournalFile::read_dir(&dir).await?;
-        let latest_journal_id: JournalId =
-            old_journals.last().map(|(id, _)| *id).unwrap_or_default();
+        let persistence_actions = PersistenceAction::rebuild(&dir).await?;
+        let recovered_version: SnapshotVersion = persistence_actions
+            .last()
+            .map(|action| action.snapshot_version())
+            .unwrap_or_default();
 
+        let next_version = recovered_version + 1;
         let mut store = Self {
             inner: RwLock::new(StoreInner {
                 state: Default::default(),
-                journal: JournalFile::open(&dir, latest_journal_id + 1).await?,
+                journal: JournalFile::open(&dir, next_version).await?,
+                dir,
+                snapshot_version: next_version,
             }),
             serializer,
             options,
         };
-        store.rebuild(&old_journals).await?;
+        store.rebuild(persistence_actions).await?;
         Ok(store)
     }
 
-    pub async fn commit<'a>(&self, command: C) -> StoreResult<()>
-    where
-        S: Serializer<C>,
-    {
+    pub async fn commit<'a>(&self, command: C) -> StoreResult<()> {
         let serialized: Vec<u8> = self
             .serializer
             .serialize(&command)
             .map_err(|err| StoreError::EncodeJournalEntry(err.into()))?;
         let mut inner = self.inner.write().await;
         let journal_file = inner
-            .writable_journal(self.options.max_journal_entries)
+            .writable_journal(self.options.max_journal_entries, &self.serializer)
             .await?;
         journal_file
             .append(&serialized)
@@ -76,22 +76,34 @@ where
         Ok(Query(self.inner.read().await))
     }
 
-    async fn rebuild(&mut self, journals: &Vec<(JournalId, PathBuf)>) -> StoreResult<()>
-    where
-        S: Serializer<C>,
-    {
+    async fn rebuild(&mut self, persistence_actions: Vec<PersistenceAction>) -> StoreResult<()> {
         let mut inner = self.inner.write().await;
-        for (_, journal) in journals {
-            let mut journal_file = File::open(journal).await.map_err(StoreError::JournalIO)?;
-            for command in JournalFile::parse(&self.serializer, &mut journal_file).await? {
-                inner.state.execute(command);
+        for action in persistence_actions {
+            match action {
+                PersistenceAction::Snapshot { path, .. } => {
+                    let file = fs::read(path).await.map_err(StoreError::SnapshotIO)?;
+                    inner.state = self
+                        .serializer
+                        .deserialize(&file[..])
+                        .map_err(|err| StoreError::DecodeSnapshot(Box::new(err)))?
+                        .ok_or(StoreError::DecodeSnapshot(Box::new(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "corrupted snapshot",
+                        ))))?;
+                }
+                PersistenceAction::Journal { path, .. } => {
+                    let mut file = File::open(path).await.map_err(StoreError::JournalIO)?;
+                    for command in JournalFile::parse(&self.serializer, &mut file).await? {
+                        inner.state.execute(command);
+                    }
+                }
             }
         }
         Ok(())
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct StoreOptions {
     max_journal_entries: NonZeroUsize,
 }
@@ -112,22 +124,52 @@ impl Default for StoreOptions {
 
 struct StoreInner<T> {
     state: T,
+    dir: PathBuf,
+    snapshot_version: SnapshotVersion,
     journal: JournalFile,
 }
 
 impl<T> StoreInner<T> {
-    async fn writable_journal(
+    async fn writable_journal<S>(
         &mut self,
         max_entries: NonZeroUsize,
-    ) -> StoreResult<&mut JournalFile> {
+        serializer: &S,
+    ) -> StoreResult<&mut JournalFile>
+    where
+        S: Serializer<T>,
+    {
         if self.journal.written_entries >= max_entries.into() || self.journal.file.is_none() {
-            self.create_new_journal().await?;
+            self.create_new_journal(serializer).await?;
         }
         Ok(&mut self.journal)
     }
 
-    async fn create_new_journal(&mut self) -> StoreResult<()> {
-        self.journal = JournalFile::open(self.journal.dir.clone(), self.journal.id + 1).await?;
+    async fn create_new_journal<S>(&mut self, serializer: &S) -> StoreResult<()>
+    where
+        S: Serializer<T>,
+    {
+        self.snapshot(serializer).await?;
+        self.journal = JournalFile::open(self.dir.clone(), self.snapshot_version).await?;
+        Ok(())
+    }
+
+    /// Writes fully serialized data to snapshot file.
+    /// From now, in case of recovery, it has priority over journal file with same [SnapshotVersion].
+    async fn snapshot<S>(&mut self, serializer: &S) -> StoreResult<()>
+    where
+        S: Serializer<T>,
+    {
+        let serialized = serializer
+            .serialize(&self.state)
+            .map_err(|err| StoreError::EncodeSnapshot(Box::new(err)))?;
+        fs::write(
+            self.dir
+                .join(format!("{:0>10}.snapshot", self.snapshot_version)),
+            serialized,
+        )
+        .await
+        .map_err(StoreError::SnapshotIO)?;
+        self.snapshot_version += 1;
         Ok(())
     }
 }
@@ -142,18 +184,16 @@ impl<'a, T> Deref for Query<'a, T> {
     }
 }
 
-type JournalId = u32;
+type SnapshotVersion = u32;
 
 #[derive(Debug)]
 struct JournalFile {
-    id: JournalId,
-    dir: PathBuf,
     file: Option<File>,
     written_entries: usize,
 }
 
 impl JournalFile {
-    pub async fn open(dir: impl Into<PathBuf>, id: JournalId) -> StoreResult<Self> {
+    pub async fn open(dir: impl Into<PathBuf>, id: SnapshotVersion) -> StoreResult<Self> {
         let dir: PathBuf = dir.into();
         let file = fs::OpenOptions::new()
             .create(true)
@@ -162,8 +202,6 @@ impl JournalFile {
             .await
             .map_err(StoreError::JournalIO)?;
         Ok(Self {
-            id,
-            dir,
             file: Some(file),
             written_entries: 0,
         })
@@ -210,27 +248,97 @@ impl JournalFile {
         }
         Ok(commands)
     }
+}
 
-    async fn read_dir(path: impl AsRef<Path>) -> StoreResult<Vec<(JournalId, PathBuf)>> {
-        let mut journals = Vec::new();
+enum PersistenceAction {
+    Snapshot {
+        snapshot_version: SnapshotVersion,
+        path: PathBuf,
+    },
+    Journal {
+        // Version of data snapshot which may not exist yet.
+        snapshot_version: SnapshotVersion,
+        path: PathBuf,
+    },
+}
+
+impl PersistenceAction {
+    /// Get only required actions to rebuild latest store state.
+    /// All journals with [SnapshotVersion] lower or equal than latest snapshot's version are skipped.
+    ///
+    /// E.g. directory containing:
+    /// - 0000000001.journal
+    /// - 0000000001.snapshot
+    /// - 0000000002.journal
+    /// will return vec of:
+    /// - 0000000001.snapshot
+    /// - 0000000002.journal
+    async fn rebuild(dir_path: impl AsRef<Path>) -> StoreResult<Vec<PersistenceAction>> {
+        let mut actions = Self::read_dir(&dir_path).await?;
+        actions.sort_by_key(|action| action.snapshot_version());
+        let latest_snapshot_id = actions
+            .iter()
+            .filter_map(|action| match action {
+                PersistenceAction::Snapshot {
+                    snapshot_version, ..
+                } => Some(*snapshot_version),
+                _ => None,
+            })
+            .last();
+        if let Some(latest_snapshot_id) = latest_snapshot_id {
+            actions.retain(|action| match action {
+                PersistenceAction::Journal {
+                    snapshot_version, ..
+                } => *snapshot_version > latest_snapshot_id,
+                PersistenceAction::Snapshot {
+                    snapshot_version, ..
+                } => *snapshot_version == latest_snapshot_id,
+            });
+        }
+        Ok(actions)
+    }
+
+    /// Read all past journals and snapshots.
+    async fn read_dir(path: impl AsRef<Path>) -> StoreResult<Vec<PersistenceAction>> {
+        let mut actions = Vec::new();
         let mut read_dir = fs::read_dir(&path).await.map_err(StoreError::JournalIO)?;
         while let Some(entry) = read_dir.next_entry().await.map_err(StoreError::JournalIO)? {
             let entry_path = entry.path();
-            if entry_path.extension().is_some_and(|ext| ext == "journal") {
-                let journal_id = entry_path
-                    .file_stem()
-                    .and_then(OsStr::to_str)
-                    .and_then(|path| path.parse::<JournalId>().ok())
-                    .ok_or_else(|| {
-                        StoreError::JournalInvalidFileName(
-                            entry_path.file_stem().map(OsStr::to_owned),
-                        )
-                    })?;
-                journals.push((journal_id, entry_path));
+            let action_id = entry_path
+                .file_stem()
+                .and_then(OsStr::to_str)
+                .and_then(|path| path.parse::<SnapshotVersion>().ok())
+                .ok_or_else(|| {
+                    StoreError::JournalInvalidFileName(entry_path.file_stem().map(OsStr::to_owned))
+                })?;
+            match entry_path.extension() {
+                Some(extension) if extension == "journal" => {
+                    actions.push(PersistenceAction::Journal {
+                        snapshot_version: action_id,
+                        path: entry_path,
+                    });
+                }
+                Some(extension) if extension == "snapshot" => {
+                    actions.push(PersistenceAction::Snapshot {
+                        snapshot_version: action_id,
+                        path: entry_path,
+                    });
+                }
+                _ => {}
             }
         }
-        journals.sort_by_key(|(id, _)| *id);
-        Ok(journals)
+        Ok(actions)
+    }
+
+    fn snapshot_version(&self) -> u32 {
+        match self {
+            PersistenceAction::Snapshot {
+                snapshot_version, ..
+            } => *snapshot_version,
+            PersistenceAction::Journal {
+                snapshot_version, ..
+            } => *snapshot_version,
+        }
     }
 }
 
@@ -322,11 +430,11 @@ mod tests {
         let store: Store<Counter, _> = Store::open(JsonSerializer, options, dir.path())
             .await
             .unwrap();
-        let first_id = store.inner.read().await.journal.id;
+        let first_ver = store.inner.read().await.snapshot_version;
         store.commit(CounterCommand::Increase).await.unwrap();
         store.commit(CounterCommand::Increase).await.unwrap();
-        assert_eq!(store.inner.read().await.journal.id, first_id);
+        assert_eq!(store.inner.read().await.snapshot_version, first_ver);
         store.commit(CounterCommand::Increase).await.unwrap();
-        assert_eq!(store.inner.read().await.journal.id, first_id + 1);
+        assert_eq!(store.inner.read().await.snapshot_version, first_ver + 1);
     }
 }
