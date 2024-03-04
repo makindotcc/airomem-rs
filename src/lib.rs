@@ -1,5 +1,6 @@
 use error::{StoreError, StoreResult};
 use std::ffi::OsStr;
+use std::num::NonZeroUsize;
 use std::ops::Deref;
 use std::path::Path;
 use std::path::PathBuf;
@@ -15,59 +16,36 @@ pub struct Store<T, S>
 where
     T: State,
 {
-    inner: RwLock<LifeState<T>>,
+    inner: RwLock<StoreInner<T>>,
     serializer: S,
-}
-
-enum LifeState<T> {
-    Alive(AliveState<T>),
-    Poisoned,
-}
-
-impl<T> LifeState<T> {
-    fn get(&self) -> StoreResult<&AliveState<T>> {
-        match self {
-            LifeState::Alive(state) => Ok(state),
-            LifeState::Poisoned => Err(StoreError::StatePoisoned),
-        }
-    }
-
-    fn get_mut(&mut self) -> StoreResult<&mut AliveState<T>> {
-        match self {
-            LifeState::Alive(state) => Ok(state),
-            LifeState::Poisoned => Err(StoreError::StatePoisoned),
-        }
-    }
-}
-
-struct AliveState<T> {
-    state: T,
-    journal_file: JournalFile,
+    options: StoreOptions,
 }
 
 impl<T, S, C> Store<T, S>
 where
     T: State<Command = C>,
 {
-    pub async fn open(serializer: S, dir: impl AsRef<Path>) -> StoreResult<Self>
+    pub async fn open(
+        serializer: S,
+        options: StoreOptions,
+        dir: impl Into<PathBuf>,
+    ) -> StoreResult<Self>
     where
         S: Serializer<T> + Serializer<C>,
     {
+        let dir: PathBuf = dir.into();
         fs::create_dir_all(&dir).await.map_err(StoreError::FileIO)?;
-        let old_journals = {
-            let mut it = JournalFile::read_dir(&dir).await?;
-            it.sort_by_key(|(id, _)| *id);
-            it
-        };
+        let old_journals = JournalFile::read_dir(&dir).await?;
         let latest_journal_id: JournalId =
             old_journals.last().map(|(id, _)| *id).unwrap_or_default();
 
         let mut store = Self {
-            inner: RwLock::new(LifeState::Alive(AliveState {
+            inner: RwLock::new(StoreInner {
                 state: Default::default(),
-                journal_file: JournalFile::open(&dir, latest_journal_id + 1).await?,
-            })),
+                journal: JournalFile::open(&dir, latest_journal_id + 1).await?,
+            }),
             serializer,
+            options,
         };
         store.rebuild(&old_journals).await?;
         Ok(store)
@@ -81,28 +59,27 @@ where
             .serializer
             .serialize(&command)
             .map_err(|err| StoreError::EncodeJournalEntry(err.into()))?;
-        let mut inner_lock = self.inner.write()?;
-        let inner = inner_lock.get_mut()?;
-        if let Err(err) = inner.journal_file.append(&serialized).await {
-            if err.kind() != std::io::ErrorKind::WriteZero {
-                *inner_lock = LifeState::Poisoned;
-            }
-            return Err(StoreError::JournalIO(err));
-        };
+        let mut inner = self.inner.write()?;
+        let journal_file = inner
+            .writable_journal(self.options.max_journal_entries)
+            .await?;
+        journal_file
+            .append(&serialized)
+            .await
+            .map_err(StoreError::JournalIO)?;
         inner.state.execute(command);
         Ok(())
     }
 
     pub fn query(&self) -> StoreResult<Query<'_, T>> {
-        Query::new(self.inner.read()?)
+        Ok(Query(self.inner.read()?))
     }
 
     async fn rebuild(&mut self, journals: &Vec<(JournalId, PathBuf)>) -> StoreResult<()>
     where
         S: Serializer<C>,
     {
-        let mut inner_lock = self.inner.write()?;
-        let inner = inner_lock.get_mut()?;
+        let mut inner = self.inner.write()?;
         for (_, journal) in journals {
             let mut journal_file = File::open(journal).await.map_err(StoreError::JournalIO)?;
             for command in JournalFile::parse(&self.serializer, &mut journal_file).await? {
@@ -113,43 +90,105 @@ where
     }
 }
 
-pub struct Query<'a, T>(std::sync::RwLockReadGuard<'a, LifeState<T>>);
+#[derive(Debug)]
+pub struct StoreOptions {
+    max_journal_entries: NonZeroUsize,
+}
 
-impl<'a, T> Query<'a, T> {
-    fn new(state: std::sync::RwLockReadGuard<'a, LifeState<T>>) -> StoreResult<Self> {
-        state.get()?;
-        Ok(Self(state))
+impl StoreOptions {
+    pub fn max_journal_entries(&mut self, value: NonZeroUsize) {
+        self.max_journal_entries = value;
     }
 }
+
+impl Default for StoreOptions {
+    fn default() -> Self {
+        Self {
+            max_journal_entries: NonZeroUsize::new(16384).unwrap(),
+        }
+    }
+}
+
+struct StoreInner<T> {
+    state: T,
+    journal: JournalFile,
+}
+
+impl<T> StoreInner<T> {
+    async fn writable_journal(
+        &mut self,
+        max_entries: NonZeroUsize,
+    ) -> StoreResult<&mut JournalFile> {
+        if self.journal.written_entries >= max_entries.into() || self.journal.file.is_none() {
+            self.create_new_journal().await?;
+        }
+        Ok(&mut self.journal)
+    }
+
+    async fn create_new_journal(&mut self) -> StoreResult<()> {
+        self.journal = JournalFile::open(self.journal.dir.clone(), self.journal.id + 1).await?;
+        Ok(())
+    }
+}
+
+pub struct Query<'a, T>(std::sync::RwLockReadGuard<'a, StoreInner<T>>);
 
 impl<'a, T> Deref for Query<'a, T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
-        &self.0.get().unwrap().state
+        &self.0.state
     }
 }
 
 type JournalId = u32;
 
+#[derive(Debug)]
 struct JournalFile {
-    file: File,
+    id: JournalId,
+    dir: PathBuf,
+    file: Option<File>,
+    written_entries: usize,
 }
 
 impl JournalFile {
-    pub async fn open(dir: impl AsRef<Path>, id: JournalId) -> StoreResult<Self> {
+    pub async fn open(dir: impl Into<PathBuf>, id: JournalId) -> StoreResult<Self> {
+        let dir: PathBuf = dir.into();
         let file = fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(dir.as_ref().join(format!("{:0>10}.journal", id)))
+            .open(dir.join(format!("{:0>10}.journal", id)))
             .await
             .map_err(StoreError::JournalIO)?;
-        Ok(Self { file })
+        Ok(Self {
+            id,
+            dir,
+            file: Some(file),
+            written_entries: 0,
+        })
     }
 
-    async fn append(&mut self, data: &[u8]) -> std::io::Result<()> {
-        self.file.write_all(data).await?;
-        self.file.sync_all().await?;
+    async fn append(&mut self, command: &[u8]) -> std::io::Result<()> {
+        let file = match &mut self.file {
+            Some(file) => file,
+            None => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "file poisoned",
+                ))
+            }
+        };
+        if let Err(err) = Self::write_data_and_sync(file, command).await {
+            self.file = None;
+            return Err(err);
+        }
+        self.written_entries += 1;
+        Ok(())
+    }
+
+    async fn write_data_and_sync(file: &mut File, data: &[u8]) -> std::io::Result<()> {
+        file.write_all(data).await?;
+        file.sync_all().await?;
         Ok(())
     }
 
@@ -189,6 +228,7 @@ impl JournalFile {
                 journals.push((journal_id, entry_path));
             }
         }
+        journals.sort_by_key(|(id, _)| *id);
         Ok(journals)
     }
 }
@@ -242,5 +282,51 @@ where
             }
             Err(err) => Err(err),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde::{Deserialize, Serialize};
+    use tempfile::tempdir;
+
+    #[derive(Serialize, Deserialize, Default, Debug)]
+    struct Counter {
+        value: usize,
+    }
+
+    impl super::State for Counter {
+        type Command = CounterCommand;
+
+        fn execute(&mut self, command: CounterCommand) {
+            match command {
+                CounterCommand::Increase => {
+                    self.value += 1;
+                }
+            }
+        }
+    }
+
+    #[derive(Serialize, Deserialize, Debug)]
+    enum CounterCommand {
+        Increase,
+    }
+
+    #[tokio::test]
+    async fn test_journal_chunking() {
+        let dir = tempdir().unwrap();
+        let mut options = StoreOptions::default();
+        options.max_journal_entries(NonZeroUsize::new(2).unwrap());
+        let store: Store<Counter, _> = Store::open(JsonSerializer, options, dir.path())
+            .await
+            .unwrap();
+        let get_journal_id = || store.inner.read().unwrap().journal.id;
+        let first_id = get_journal_id();
+        store.commit(CounterCommand::Increase).await.unwrap();
+        store.commit(CounterCommand::Increase).await.unwrap();
+        assert_eq!(get_journal_id(), first_id);
+        store.commit(CounterCommand::Increase).await.unwrap();
+        assert_eq!(get_journal_id(), first_id + 1);
     }
 }

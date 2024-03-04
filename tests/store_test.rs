@@ -1,4 +1,4 @@
-use airomem::{JsonSerializer, JsonStore, Store};
+use airomem::{JsonSerializer, JsonStore, Store, StoreOptions};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use tempfile::tempdir;
@@ -34,7 +34,10 @@ enum SessionsCommand {
 #[tokio::test]
 async fn test_mem_commit() {
     let dir = tempdir().unwrap();
-    let store: SessionsStore = Store::open(JsonSerializer, &dir).await.unwrap();
+    let store: SessionsStore =
+        Store::open(JsonSerializer, StoreOptions::default(), dir.into_path())
+            .await
+            .unwrap();
     store
         .commit(SessionsCommand::CreateSession {
             token: "access_token".to_string(),
@@ -52,7 +55,9 @@ async fn test_mem_commit() {
 async fn test_journal_rebuild() {
     let dir = tempdir().unwrap();
     for i in 0..2 {
-        let store: SessionsStore = Store::open(JsonSerializer, &dir).await.unwrap();
+        let store: SessionsStore = Store::open(JsonSerializer, StoreOptions::default(), dir.path())
+            .await
+            .unwrap();
         store
             .commit(SessionsCommand::CreateSession {
                 token: format!("token{i}"),
@@ -61,7 +66,10 @@ async fn test_journal_rebuild() {
             .await
             .unwrap();
     }
-    let store: SessionsStore = Store::open(JsonSerializer, &dir).await.unwrap();
+    let store: SessionsStore =
+        Store::open(JsonSerializer, StoreOptions::default(), dir.into_path())
+            .await
+            .unwrap();
     let expected_tokens = {
         let mut it = HashMap::new();
         it.insert("token0".to_string(), 0);
