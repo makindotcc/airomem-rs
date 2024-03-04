@@ -15,11 +15,32 @@ pub struct Store<T, S>
 where
     T: State,
 {
-    inner: RwLock<StateSynchronized<T>>,
+    inner: RwLock<LifeState<T>>,
     serializer: S,
 }
 
-struct StateSynchronized<T> {
+enum LifeState<T> {
+    Alive(AliveState<T>),
+    Poisoned,
+}
+
+impl<T> LifeState<T> {
+    fn get(&self) -> StoreResult<&AliveState<T>> {
+        match self {
+            LifeState::Alive(state) => Ok(state),
+            LifeState::Poisoned => Err(StoreError::StatePoisoned),
+        }
+    }
+
+    fn get_mut(&mut self) -> StoreResult<&mut AliveState<T>> {
+        match self {
+            LifeState::Alive(state) => Ok(state),
+            LifeState::Poisoned => Err(StoreError::StatePoisoned),
+        }
+    }
+}
+
+struct AliveState<T> {
     state: T,
     journal_file: JournalFile,
 }
@@ -42,10 +63,10 @@ where
             old_journals.last().map(|(id, _)| *id).unwrap_or_default();
 
         let mut store = Self {
-            inner: RwLock::new(StateSynchronized {
+            inner: RwLock::new(LifeState::Alive(AliveState {
                 state: Default::default(),
                 journal_file: JournalFile::open(&dir, latest_journal_id + 1).await?,
-            }),
+            })),
             serializer,
         };
         store.rebuild(&old_journals).await?;
@@ -60,38 +81,52 @@ where
             .serializer
             .serialize(&command)
             .map_err(|err| StoreError::EncodeJournalEntry(err.into()))?;
-        let mut foo = self.inner.write()?;
-        foo.state.execute(command);
-        foo.journal_file.append(&serialized).await?;
+        let mut inner_lock = self.inner.write()?;
+        let inner = inner_lock.get_mut()?;
+        if let Err(err) = inner.journal_file.append(&serialized).await {
+            if err.kind() != std::io::ErrorKind::WriteZero {
+                *inner_lock = LifeState::Poisoned;
+            }
+            return Err(StoreError::JournalIO(err));
+        };
+        inner.state.execute(command);
         Ok(())
     }
 
     pub fn query(&self) -> StoreResult<Query<'_, T>> {
-        Ok(Query(self.inner.read()?))
+        Query::new(self.inner.read()?)
     }
 
     async fn rebuild(&mut self, journals: &Vec<(JournalId, PathBuf)>) -> StoreResult<()>
     where
         S: Serializer<C>,
     {
-        let mut data = self.inner.write()?;
+        let mut inner_lock = self.inner.write()?;
+        let inner = inner_lock.get_mut()?;
         for (_, journal) in journals {
             let mut journal_file = File::open(journal).await.map_err(StoreError::JournalIO)?;
             for command in JournalFile::parse(&self.serializer, &mut journal_file).await? {
-                data.state.execute(command);
+                inner.state.execute(command);
             }
         }
         Ok(())
     }
 }
 
-pub struct Query<'a, T>(std::sync::RwLockReadGuard<'a, StateSynchronized<T>>);
+pub struct Query<'a, T>(std::sync::RwLockReadGuard<'a, LifeState<T>>);
+
+impl<'a, T> Query<'a, T> {
+    fn new(state: std::sync::RwLockReadGuard<'a, LifeState<T>>) -> StoreResult<Self> {
+        state.get()?;
+        Ok(Self(state))
+    }
+}
 
 impl<'a, T> Deref for Query<'a, T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
-        &self.0.state
+        &self.0.get().unwrap().state
     }
 }
 
@@ -112,12 +147,9 @@ impl JournalFile {
         Ok(Self { file })
     }
 
-    async fn append(&mut self, data: &[u8]) -> StoreResult<()> {
-        self.file
-            .write_all(data)
-            .await
-            .map_err(StoreError::JournalIO)?;
-        self.file.sync_all().await.map_err(StoreError::JournalIO)?;
+    async fn append(&mut self, data: &[u8]) -> std::io::Result<()> {
+        self.file.write_all(data).await?;
+        self.file.sync_all().await?;
         Ok(())
     }
 

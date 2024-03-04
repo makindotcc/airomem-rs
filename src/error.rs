@@ -14,7 +14,7 @@ pub enum StoreError {
     FileIO(std::io::Error),
     #[error("invalid journal file name: {0:?}")]
     JournalInvalidFileName(Option<OsString>),
-    #[error("state lock poisoned")]
+    #[error("state poisoned")]
     StatePoisoned,
 }
 
