@@ -1,0 +1,55 @@
+use airomem::{JsonSerializer, JsonStore, Store};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use tempfile::tempdir;
+
+type SessionsStore = JsonStore<Sessions, SessionsCommand>;
+
+#[derive(Serialize, Deserialize, Default, Debug)]
+struct Sessions {
+    tokens: HashMap<String, usize>,
+}
+
+impl airomem::State for Sessions {
+    type Command = SessionsCommand;
+
+    fn execute(&mut self, command: SessionsCommand) {
+        match command {
+            SessionsCommand::CreateSession { token, user_id } => {
+                self.tokens.insert(token, user_id);
+            }
+            SessionsCommand::DeleteSession { token } => {
+                self.tokens.remove(&token);
+            }
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+enum SessionsCommand {
+    CreateSession { token: String, user_id: usize },
+    DeleteSession { token: String },
+}
+
+#[tokio::test]
+async fn test_journal_rebuild() {
+    let dir = tempdir().unwrap();
+    for i in 0..2 {
+        let mut store: SessionsStore = Store::open(JsonSerializer, &dir).await.unwrap();
+        store
+            .commit(SessionsCommand::CreateSession {
+                token: format!("token{i}"),
+                user_id: i,
+            })
+            .await
+            .unwrap();
+    }
+    let store: SessionsStore = Store::open(JsonSerializer, &dir).await.unwrap();
+    let expected_tokens = {
+        let mut it = HashMap::new();
+        it.insert("token0".to_string(), 0);
+        it.insert("token1".to_string(), 1);
+        it
+    };
+    assert_eq!(store.query().tokens, expected_tokens);
+}
