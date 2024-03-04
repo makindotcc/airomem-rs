@@ -4,9 +4,10 @@ use std::num::NonZeroUsize;
 use std::ops::Deref;
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::RwLock;
 use tokio::fs::{self, File};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::RwLock;
+use tokio::sync::RwLockReadGuard;
 
 pub mod error;
 
@@ -59,7 +60,7 @@ where
             .serializer
             .serialize(&command)
             .map_err(|err| StoreError::EncodeJournalEntry(err.into()))?;
-        let mut inner = self.inner.write()?;
+        let mut inner = self.inner.write().await;
         let journal_file = inner
             .writable_journal(self.options.max_journal_entries)
             .await?;
@@ -71,15 +72,15 @@ where
         Ok(())
     }
 
-    pub fn query(&self) -> StoreResult<Query<'_, T>> {
-        Ok(Query(self.inner.read()?))
+    pub async fn query(&self) -> StoreResult<Query<'_, T>> {
+        Ok(Query(self.inner.read().await))
     }
 
     async fn rebuild(&mut self, journals: &Vec<(JournalId, PathBuf)>) -> StoreResult<()>
     where
         S: Serializer<C>,
     {
-        let mut inner = self.inner.write()?;
+        let mut inner = self.inner.write().await;
         for (_, journal) in journals {
             let mut journal_file = File::open(journal).await.map_err(StoreError::JournalIO)?;
             for command in JournalFile::parse(&self.serializer, &mut journal_file).await? {
@@ -131,7 +132,7 @@ impl<T> StoreInner<T> {
     }
 }
 
-pub struct Query<'a, T>(std::sync::RwLockReadGuard<'a, StoreInner<T>>);
+pub struct Query<'a, T>(RwLockReadGuard<'a, StoreInner<T>>);
 
 impl<'a, T> Deref for Query<'a, T> {
     type Target = T;
@@ -244,7 +245,7 @@ pub trait Serializer<C> {
 
     fn serialize(&self, command: &C) -> Result<Vec<u8>, Self::Error>;
 
-    fn deserialize<'a, R>(&self, reader: R) -> Result<Option<C>, Self::Error>
+    fn deserialize<R>(&self, reader: R) -> Result<Option<C>, Self::Error>
     where
         R: std::io::Read;
 }
@@ -321,12 +322,11 @@ mod tests {
         let store: Store<Counter, _> = Store::open(JsonSerializer, options, dir.path())
             .await
             .unwrap();
-        let get_journal_id = || store.inner.read().unwrap().journal.id;
-        let first_id = get_journal_id();
+        let first_id = store.inner.read().await.journal.id;
         store.commit(CounterCommand::Increase).await.unwrap();
         store.commit(CounterCommand::Increase).await.unwrap();
-        assert_eq!(get_journal_id(), first_id);
+        assert_eq!(store.inner.read().await.journal.id, first_id);
         store.commit(CounterCommand::Increase).await.unwrap();
-        assert_eq!(get_journal_id(), first_id + 1);
+        assert_eq!(store.inner.read().await.journal.id, first_id + 1);
     }
 }

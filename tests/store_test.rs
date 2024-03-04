@@ -48,7 +48,7 @@ async fn test_mem_commit() {
 
     let mut expected_tokens = HashMap::new();
     expected_tokens.insert("access_token".to_string(), 1);
-    assert_eq!(store.query().unwrap().tokens, expected_tokens);
+    assert_eq!(store.query().await.unwrap().tokens, expected_tokens);
 }
 
 #[tokio::test]
@@ -76,5 +76,5 @@ async fn test_journal_rebuild() {
         it.insert("token1".to_string(), 1);
         it
     };
-    assert_eq!(store.query().unwrap().tokens, expected_tokens);
+    assert_eq!(store.query().await.unwrap().tokens, expected_tokens);
 }

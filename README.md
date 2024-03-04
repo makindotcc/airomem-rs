@@ -67,6 +67,6 @@ async fn test_mem_commit() {
 
     let mut expected_tokens = HashMap::new();
     expected_tokens.insert("access_token".to_string(), 1);
-    assert_eq!(store.query().unwrap().tokens, expected_tokens);
+    assert_eq!(store.query().await.tokens, expected_tokens);
 }
 ```
