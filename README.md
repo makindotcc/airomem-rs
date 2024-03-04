@@ -57,7 +57,10 @@ enum SessionsCommand {
 #[tokio::test]
 async fn test_mem_commit() {
     let dir = tempdir().unwrap();
-    let store: SessionsStore = Store::open(JsonSerializer, &dir).await.unwrap();
+    let store: SessionsStore =
+        Store::open(JsonSerializer, StoreOptions::default(), dir.into_path())
+            .await
+            .unwrap();
     store
         .commit(SessionsCommand::CreateSession {
             token: "access_token".to_string(),
