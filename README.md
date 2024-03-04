@@ -1,5 +1,6 @@
 # Airomem-rs
 
+[Release at crates.io](https://crates.io/crates/airomem) \
 (Toy) persistence library for Rust inspired by [prevayler for java](https://prevayler.org/) and named after its wrapper [airomem](https://github.com/airomem/airomem).
 
 > It is an implementation of the Prevalent System design pattern, in which business objects are kept live in memory and transactions are journaled for system recovery.
