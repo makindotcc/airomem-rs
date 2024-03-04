@@ -72,8 +72,8 @@ where
         Ok(())
     }
 
-    pub async fn query(&self) -> StoreResult<Query<'_, T>> {
-        Ok(Query(self.inner.read().await))
+    pub async fn query(&self) -> Query<'_, T> {
+        Query(self.inner.read().await)
     }
 
     async fn rebuild(&mut self, persistence_actions: Vec<PersistenceAction>) -> StoreResult<()> {
