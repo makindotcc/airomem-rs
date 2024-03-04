@@ -25,7 +25,7 @@
 
 ## Example
 
-```rs
+```rust
 type SessionsStore = JsonStore<Sessions>;
 
 #[derive(Serialize, Deserialize, Default, Debug)]
