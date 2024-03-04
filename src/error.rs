@@ -1,4 +1,4 @@
-use std::ffi::OsString;
+use std::{ffi::OsString, sync::PoisonError};
 
 pub type StoreResult<T> = std::result::Result<T, StoreError>;
 
@@ -14,4 +14,12 @@ pub enum StoreError {
     FileIO(std::io::Error),
     #[error("invalid journal file name: {0:?}")]
     JournalInvalidFileName(Option<OsString>),
+    #[error("state lock poisoned")]
+    StatePoisoned,
+}
+
+impl<T> From<PoisonError<T>> for StoreError {
+    fn from(_: PoisonError<T>) -> Self {
+        Self::StatePoisoned
+    }
 }

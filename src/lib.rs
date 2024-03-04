@@ -1,7 +1,9 @@
 use error::{StoreError, StoreResult};
 use std::ffi::OsStr;
+use std::ops::Deref;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::RwLock;
 use tokio::fs::{self, File};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -13,8 +15,12 @@ pub struct Store<T, S>
 where
     T: State,
 {
-    data: T,
+    inner: RwLock<StateSynchronized<T>>,
     serializer: S,
+}
+
+struct StateSynchronized<T> {
+    state: T,
     journal_file: JournalFile,
 }
 
@@ -36,15 +42,17 @@ where
             old_journals.last().map(|(id, _)| *id).unwrap_or_default();
 
         let mut store = Self {
-            data: Default::default(),
+            inner: RwLock::new(StateSynchronized {
+                state: Default::default(),
+                journal_file: JournalFile::open(&dir, latest_journal_id + 1).await?,
+            }),
             serializer,
-            journal_file: JournalFile::open(&dir, latest_journal_id + 1).await?,
         };
         store.rebuild(&old_journals).await?;
         Ok(store)
     }
 
-    pub async fn commit<'a>(&mut self, command: C) -> StoreResult<()>
+    pub async fn commit<'a>(&self, command: C) -> StoreResult<()>
     where
         S: Serializer<C>,
     {
@@ -52,26 +60,38 @@ where
             .serializer
             .serialize(&command)
             .map_err(|err| StoreError::EncodeJournalEntry(err.into()))?;
-        self.data.execute(command);
-        self.journal_file.append(&serialized).await?;
+        let mut foo = self.inner.write()?;
+        foo.state.execute(command);
+        foo.journal_file.append(&serialized).await?;
         Ok(())
     }
 
-    pub fn query(&self) -> &T {
-        &self.data
+    pub fn query(&self) -> StoreResult<Query<'_, T>> {
+        Ok(Query(self.inner.read()?))
     }
 
     async fn rebuild(&mut self, journals: &Vec<(JournalId, PathBuf)>) -> StoreResult<()>
     where
         S: Serializer<C>,
     {
+        let mut data = self.inner.write()?;
         for (_, journal) in journals {
             let mut journal_file = File::open(journal).await.map_err(StoreError::JournalIO)?;
             for command in JournalFile::parse(&self.serializer, &mut journal_file).await? {
-                self.data.execute(command);
+                data.state.execute(command);
             }
         }
         Ok(())
+    }
+}
+
+pub struct Query<'a, T>(std::sync::RwLockReadGuard<'a, StateSynchronized<T>>);
+
+impl<'a, T> Deref for Query<'a, T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0.state
     }
 }
 
