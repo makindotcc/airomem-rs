@@ -7,7 +7,7 @@
 
 ## Assumptions
 
-- All data lives in memory guarded with `std::sync::RwLock`, reads are fast and concurrent safe.
+- All data lives in memory guarded with `tokio::sync::RwLock`, reads are fast and concurrent safe.
 - Every command is saved to append-only journal file and immediately [fsynced](https://man7.org/linux/man-pages/man2/fsync.2.html).
   By that, individual writes are slower, but they SHOULD survive crashes (e.g. power outage, software panic).
 - I don't guarantee durability, it's created for toy projects or non-relevant data like http authorization tokens/cookies. https://www.postgresql.org/docs/9.4/wal-reliability.html
