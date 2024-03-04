@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use tempfile::tempdir;
 
-type SessionsStore = JsonStore<Sessions, SessionsCommand>;
+type SessionsStore = JsonStore<Sessions>;
 
 #[derive(Serialize, Deserialize, Default, Debug)]
 struct Sessions {

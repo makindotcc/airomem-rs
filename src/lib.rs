@@ -1,32 +1,30 @@
 use error::{StoreError, StoreResult};
 use std::ffi::OsStr;
+use std::path::Path;
 use std::path::PathBuf;
-use std::{marker::PhantomData, path::Path};
 use tokio::fs::{self, File};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 pub mod error;
 
-pub type JsonStore<D, C> = Store<D, C, JsonSerializer>;
+pub type JsonStore<D> = Store<D, JsonSerializer>;
 
-pub struct Store<T, C, S>
+pub struct Store<T, S>
 where
     T: State,
 {
     data: T,
     serializer: S,
     journal_file: JournalFile,
-    _phantom: PhantomData<C>,
 }
 
-impl<T, C, S> Store<T, C, S>
+impl<T, S, C> Store<T, S>
 where
     T: State<Command = C>,
 {
     pub async fn open(serializer: S, dir: impl AsRef<Path>) -> StoreResult<Self>
     where
         S: Serializer<T> + Serializer<C>,
-        <S as Serializer<C>>::Error: 'static,
     {
         fs::create_dir_all(&dir).await.map_err(StoreError::FileIO)?;
         let old_journals = {
@@ -41,7 +39,6 @@ where
             data: Default::default(),
             serializer,
             journal_file: JournalFile::open(&dir, latest_journal_id + 1).await?,
-            _phantom: PhantomData,
         };
         store.rebuild(&old_journals).await?;
         Ok(store)
