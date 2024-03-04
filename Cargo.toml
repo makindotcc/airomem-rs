@@ -2,7 +2,7 @@
 name = "airomem"
 version = "0.1.0"
 edition = "2021"
-repository = ""
+repository = "https://github.com/makindotcc/airomem-rs"
 categories = ["database-implementations"]
 description = "Simple persistence library inspired by Prevayler and @jarekratajski"
 license = "MIT"
