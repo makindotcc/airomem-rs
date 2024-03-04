@@ -349,7 +349,7 @@ pub trait State: Default {
 }
 
 pub trait Serializer<C> {
-    type Error: std::error::Error + 'static;
+    type Error: std::error::Error + Send + Sync + 'static;
 
     fn serialize(&self, command: &C) -> Result<Vec<u8>, Self::Error>;
 

@@ -2,16 +2,18 @@ use std::{ffi::OsString, sync::PoisonError};
 
 pub type StoreResult<T> = std::result::Result<T, StoreError>;
 
+pub type AnyError = Box<dyn std::error::Error + Send + Sync + 'static>;
+
 #[derive(thiserror::Error, Debug)]
 pub enum StoreError {
     #[error("could not encode journal entry")]
-    EncodeJournalEntry(Box<dyn std::error::Error>),
+    EncodeJournalEntry(AnyError),
     #[error("could not decode journal entry")]
-    DecodeJournalEntry(Box<dyn std::error::Error>),
+    DecodeJournalEntry(AnyError),
     #[error("Could not encode snapshot: {0:?}")]
-    EncodeSnapshot(Box<dyn std::error::Error>),
+    EncodeSnapshot(AnyError),
     #[error("Could not restore snapshot: {0:?}. Remove it to rebuild it from journal logs")]
-    DecodeSnapshot(Box<dyn std::error::Error>),
+    DecodeSnapshot(AnyError),
     #[error("io error ocurred while accessing journal file: {0}")]
     JournalIO(std::io::Error),
     #[error("io error ocurred while accessing snapshot file: {0}")]
