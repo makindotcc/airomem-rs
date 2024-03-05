@@ -158,8 +158,9 @@ pub struct StoreOptions {
 impl StoreOptions {
     /// Maximal amount of persisted commands in journal file before a
     /// snapshot is created and a new journal file.
-    pub fn max_journal_entries(&mut self, value: NonZeroUsize) {
+    pub fn max_journal_entries(mut self, value: NonZeroUsize) -> Self {
         self.max_journal_entries = value;
+        self
     }
 
     /// Dictates [Store] how often commands should be saved to [JournalFile].
@@ -559,8 +560,7 @@ mod tests {
     #[tokio::test]
     async fn test_journal_chunking() {
         let dir = tempdir().unwrap();
-        let mut options = StoreOptions::default();
-        options.max_journal_entries(NonZeroUsize::new(2).unwrap());
+        let options = StoreOptions::default().max_journal_entries(NonZeroUsize::new(2).unwrap());
         let store: Store<Counter, _> = Store::open(JsonSerializer, options, dir.path())
             .await
             .unwrap();
@@ -578,9 +578,7 @@ mod tests {
     #[tokio::test]
     async fn test_retake_unfulfilled_journal_on_recovery() {
         let dir = tempdir().unwrap();
-        let mut options = StoreOptions::default();
-        options.max_journal_entries(NonZeroUsize::new(10).unwrap());
-
+        let options = StoreOptions::default().max_journal_entries(NonZeroUsize::new(10).unwrap());
         let first_ver = {
             let store: Store<Counter, _> = Store::open(JsonSerializer, options.clone(), dir.path())
                 .await

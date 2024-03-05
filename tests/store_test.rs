@@ -108,8 +108,7 @@ async fn test_manual_flush() {
 #[tokio::test]
 async fn test_journal_rebuild() {
     let dir = tempdir().unwrap();
-    let mut options = StoreOptions::default();
-    options.max_journal_entries(NonZeroUsize::new(10).unwrap());
+    let options = StoreOptions::default().max_journal_entries(NonZeroUsize::new(10).unwrap());
     for i in 0..2 {
         let store: SessionsStore = Store::open(JsonSerializer, options.clone(), dir.path())
             .await
@@ -136,8 +135,7 @@ async fn test_journal_rebuild() {
 
 #[tokio::test]
 async fn test_rebuild_with_snapshot() {
-    let mut options = StoreOptions::default();
-    options.max_journal_entries(NonZeroUsize::new(2).unwrap());
+    let options = StoreOptions::default().max_journal_entries(NonZeroUsize::new(2).unwrap());
     for commits in 0..=5 {
         let dir = tempdir().unwrap();
         {
