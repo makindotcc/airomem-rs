@@ -138,7 +138,12 @@ where
     T: State,
 {
     fn drop(&mut self) {
-        if self.options.flush_synchronously_on_drop {
+        if self.options.flush_synchronously_on_drop
+            && !matches!(
+                self.options.journal_flush_policy,
+                JournalFlushPolicy::EveryCommit
+            )
+        {
             futures::executor::block_on(async move {
                 if let Err(err) = self.flush_and_sync().await {
                     eprintln!("Could not flush journal log on drop: {err:?}");
@@ -363,8 +368,10 @@ impl JournalFile {
 
     async fn flush_and_sync(&mut self) -> std::io::Result<()> {
         let writer = self.get_writer()?;
-        writer.flush().await?;
-        writer.get_mut().sync_data().await?;
+        if !writer.buffer().is_empty() {
+            writer.flush().await?;
+            writer.get_mut().sync_data().await?;
+        }
         Ok(())
     }
 
