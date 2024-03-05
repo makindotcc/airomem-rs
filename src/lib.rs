@@ -300,13 +300,19 @@ where
         let serialized = serializer
             .serialize(&self.state)
             .map_err(|err| StoreError::EncodeSnapshot(Box::new(err)))?;
-        fs::write(
-            self.dir
-                .join(format!("{:0>10}.snapshot", self.next_snapshot_version)),
-            serialized,
-        )
-        .await
-        .map_err(StoreError::SnapshotIO)?;
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(
+                self.dir
+                    .join(format!("{:0>10}.snapshot", self.next_snapshot_version)),
+            )
+            .await
+            .map_err(StoreError::SnapshotIO)?;
+        file.write_all(&serialized)
+            .await
+            .map_err(StoreError::SnapshotIO)?;
+        file.sync_data().await.map_err(StoreError::SnapshotIO)?;
         self.next_snapshot_version += 1;
         Ok(())
     }
