@@ -179,7 +179,7 @@ impl StoreOptions {
 impl Default for StoreOptions {
     fn default() -> Self {
         Self {
-            max_journal_entries: NonZeroUsize::new(16384).unwrap(),
+            max_journal_entries: NonZeroUsize::new(65535).unwrap(),
             journal_flush_policy: JournalFlushPolicy::EveryCommit,
             flush_synchronously_on_drop: true,
         }
