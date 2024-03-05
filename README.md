@@ -8,8 +8,10 @@
 ## Assumptions
 
 - All data lives in memory guarded with `tokio::sync::RwLock`, reads are fast and concurrent safe.
-- Every command is saved to append-only journal file and immediately [fsynced](https://man7.org/linux/man-pages/man2/fsync.2.html).
-  By that, individual writes are slower, but they SHOULD survive crashes (e.g. power outage, software panic).
+- By default every command is saved to append-only journal file and immediately [fsynced](https://man7.org/linux/man-pages/man2/fsync.2.html).
+  By that, individual writes are slow, but they SHOULD survive crashes (e.g. power outage, software panic). \
+  However, you can set periodic sync or manual. See `JournalFlushPolicy` for more info.
+  Recommended for data that may be lost (e.g. cache, http session storage).
 - I don't guarantee durability, it's created for toy projects or non-relevant data like http authorization tokens/cookies. https://www.postgresql.org/docs/9.4/wal-reliability.html
 
 ## Features

@@ -1,4 +1,4 @@
-use airomem::{JsonSerializer, JsonStore, Store, StoreOptions};
+use airomem::{JournalFlushPolicy, JsonSerializer, JsonStore, Store, StoreOptions};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, num::NonZeroUsize};
 use tempfile::tempdir;
@@ -51,6 +51,58 @@ async fn test_mem_commit() {
     let mut expected_tokens = HashMap::new();
     expected_tokens.insert("access_token".to_string(), 1);
     assert_eq!(store.query().await.tokens, expected_tokens);
+}
+
+#[tokio::test]
+async fn test_manual_flush() {
+    let dir = tempdir().unwrap();
+    let do_store_commit = |options: StoreOptions| {
+        let dir = dir.path();
+        async move {
+            let store: SessionsStore = Store::open(JsonSerializer, options, dir).await.unwrap();
+            store
+                .commit(SessionsCommand::CreateSession {
+                    token: "access_token".to_string(),
+                    user_id: 1,
+                })
+                .await
+                .unwrap();
+        }
+    };
+
+    {
+        do_store_commit(
+            StoreOptions::default()
+                .journal_flush_policy(JournalFlushPolicy::Manually)
+                .flush_synchronously_on_drop(false),
+        )
+        .await;
+        let store: SessionsStore = Store::open(JsonSerializer, StoreOptions::default(), dir.path())
+            .await
+            .unwrap();
+        assert_eq!(
+            store.query().await.tokens.len(),
+            0,
+            "flushed journal log on drop, but it shouldn't"
+        );
+    }
+
+    {
+        do_store_commit(
+            StoreOptions::default()
+                .journal_flush_policy(JournalFlushPolicy::Manually)
+                .flush_synchronously_on_drop(true),
+        )
+        .await;
+        let store: SessionsStore = Store::open(JsonSerializer, StoreOptions::default(), dir.path())
+            .await
+            .unwrap();
+        assert_eq!(
+            store.query().await.tokens.len(),
+            1,
+            "should flush journal log on drop"
+        );
+    }
 }
 
 #[tokio::test]

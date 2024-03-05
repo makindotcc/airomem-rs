@@ -1,13 +1,19 @@
 use error::{StoreError, StoreResult};
+use std::convert::Infallible;
 use std::ffi::OsStr;
 use std::num::NonZeroUsize;
 use std::ops::Deref;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
 use tokio::fs::{self, File};
+use tokio::io::BufWriter;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::RwLock;
 use tokio::sync::RwLockReadGuard;
+use tokio::task::JoinHandle;
+use tokio::time::sleep;
 
 pub mod error;
 
@@ -17,21 +23,25 @@ pub struct Store<T, S>
 where
     T: State,
 {
-    inner: RwLock<StoreInner<T>>,
+    inner: SharedStoreInner<T>,
     serializer: S,
     options: StoreOptions,
+    _flush_guard: Option<FlushGuard>,
 }
 
-impl<T, S, C> Store<T, S>
+impl<T, S> Store<T, S>
 where
-    T: State<Command = C>,
-    S: Serializer<T> + Serializer<C>,
+    T: State,
 {
-    pub async fn open(
+    pub async fn open<C>(
         serializer: S,
         options: StoreOptions,
         dir: impl Into<PathBuf>,
-    ) -> StoreResult<Self> {
+    ) -> StoreResult<Self>
+    where
+        T: State<Command = C> + Sync + Send + 'static,
+        S: Serializer<C> + Serializer<T>,
+    {
         let dir: PathBuf = dir.into();
         fs::create_dir_all(&dir).await.map_err(StoreError::FileIO)?;
         let persistence_actions = PersistenceAction::rebuild(&dir).await?;
@@ -42,21 +52,30 @@ where
                 PersistenceAction::Journal { version, .. } => *version,
             })
             .unwrap_or_default();
-        let mut store = Self {
-            inner: RwLock::new(StoreInner {
-                state: Default::default(),
-                journal: JournalFile::open(&dir, next_snapshot_version).await?,
-                dir,
-                next_snapshot_version,
-            }),
+        let inner = Arc::new(RwLock::new({
+            let mut inner = StoreInner::new(dir, next_snapshot_version).await?;
+            inner.rebuild(&serializer, persistence_actions).await?;
+            inner
+        }));
+        let flush_guard = match options.journal_flush_policy {
+            JournalFlushPolicy::EveryCommit | JournalFlushPolicy::Manually => None,
+            JournalFlushPolicy::Every(interval) => {
+                Some(Self::start_flusher(interval, Arc::clone(&inner)))
+            }
+        };
+        Ok(Self {
+            inner,
             serializer,
             options,
-        };
-        store.rebuild(persistence_actions).await?;
-        Ok(store)
+            _flush_guard: flush_guard,
+        })
     }
 
-    pub async fn commit<'a>(&self, command: C) -> StoreResult<()> {
+    pub async fn commit<'a, C>(&self, command: C) -> StoreResult<()>
+    where
+        T: State<Command = C> + Sync + Send + 'static,
+        S: Serializer<C> + Serializer<T>,
+    {
         let serialized: Vec<u8> = self
             .serializer
             .serialize(&command)
@@ -69,6 +88,12 @@ where
             .append(&serialized)
             .await
             .map_err(StoreError::JournalIO)?;
+        if let JournalFlushPolicy::EveryCommit = self.options.journal_flush_policy {
+            journal_file
+                .flush_and_sync()
+                .await
+                .map_err(StoreError::JournalIO)?;
+        }
         inner.state.execute(command);
         Ok(())
     }
@@ -79,14 +104,147 @@ where
         QueryGuard(self.inner.read().await)
     }
 
-    async fn rebuild(&mut self, persistence_actions: Vec<PersistenceAction>) -> StoreResult<()> {
-        let mut inner = self.inner.write().await;
+    /// Flushes buffered commands to file and synces it using [File::sync_all].
+    pub async fn flush_and_sync(&self) -> StoreResult<()> {
+        self.inner
+            .write()
+            .await
+            .journal
+            .flush_and_sync()
+            .await
+            .map_err(StoreError::JournalIO)?;
+        Ok(())
+    }
+
+    fn start_flusher<C>(interval: Duration, inner: SharedStoreInner<T>) -> FlushGuard
+    where
+        T: State<Command = C> + Sync + Send + 'static,
+        S: Serializer<C>,
+    {
+        FlushGuard(tokio::spawn(async move {
+            loop {
+                sleep(interval).await;
+                let mut inner = inner.write().await;
+                if let Err(err) = inner.journal.flush_and_sync().await {
+                    eprintln!("Could not flush journal log: {err:?}");
+                }
+            }
+        }))
+    }
+}
+
+impl<T, S> Drop for Store<T, S>
+where
+    T: State,
+{
+    fn drop(&mut self) {
+        if self.options.flush_synchronously_on_drop {
+            futures::executor::block_on(async move {
+                if let Err(err) = self.flush_and_sync().await {
+                    eprintln!("Could not flush journal log on drop: {err:?}");
+                };
+            });
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct StoreOptions {
+    max_journal_entries: NonZeroUsize,
+    journal_flush_policy: JournalFlushPolicy,
+    flush_synchronously_on_drop: bool,
+}
+
+impl StoreOptions {
+    /// Maximal amount of persisted commands in journal file before a
+    /// snapshot is created and a new journal file.
+    pub fn max_journal_entries(&mut self, value: NonZeroUsize) {
+        self.max_journal_entries = value;
+    }
+
+    /// Dictates [Store] how often commands should be saved to [JournalFile].
+    pub fn journal_flush_policy(mut self, value: JournalFlushPolicy) -> Self {
+        self.journal_flush_policy = value;
+        self
+    }
+
+    /// Should [Store] synchronously [Store::flush_and_sync] on [Store::drop]?
+    pub fn flush_synchronously_on_drop(mut self, value: bool) -> Self {
+        self.flush_synchronously_on_drop = value;
+        self
+    }
+}
+
+impl Default for StoreOptions {
+    fn default() -> Self {
+        Self {
+            max_journal_entries: NonZeroUsize::new(16384).unwrap(),
+            journal_flush_policy: JournalFlushPolicy::EveryCommit,
+            flush_synchronously_on_drop: true,
+        }
+    }
+}
+
+/// Dictates [Store] how often commands should be saved to [JournalFile].
+#[derive(Debug, Clone, Copy)]
+pub enum JournalFlushPolicy {
+    /// Slowest, but safest. Immediately saves command to file on [Store::commit].
+    EveryCommit,
+    /// [Store] will own background task that will attempt to flush commands every defined [Duration].
+    /// Commands commited between flushes might be lost in case of crash.
+    /// Any flush errors are printed to stderr using [eprintln!].
+    Every(Duration),
+    /// You are responsible for flushing data to file using [Store::flush_and_sync].
+    Manually,
+}
+
+struct FlushGuard(JoinHandle<Infallible>);
+
+impl Drop for FlushGuard {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+type SharedStoreInner<T> = Arc<RwLock<StoreInner<T>>>;
+
+struct StoreInner<T> {
+    state: T,
+    dir: PathBuf,
+    next_snapshot_version: SnapshotVersion,
+    journal: JournalFile,
+}
+
+impl<T> StoreInner<T>
+where
+    T: State,
+{
+    async fn new(dir: PathBuf, next_snapshot_version: SnapshotVersion) -> StoreResult<Self>
+    where
+        T: Default,
+    {
+        Ok(Self {
+            state: Default::default(),
+            journal: JournalFile::open(&dir, next_snapshot_version).await?,
+            dir,
+            next_snapshot_version,
+        })
+    }
+
+    async fn rebuild<C, S>(
+        &mut self,
+        serializer: &S,
+        persistence_actions: Vec<PersistenceAction>,
+    ) -> StoreResult<()>
+    where
+        T: State<Command = C>,
+        S: Serializer<T> + Serializer<C>,
+    {
         for action in persistence_actions {
             match action {
                 PersistenceAction::Snapshot { path, .. } => {
                     let file = fs::read(path).await.map_err(StoreError::SnapshotIO)?;
-                    inner.state = self
-                        .serializer
+                    self.state = serializer
                         .deserialize(&file[..])
                         .map_err(|err| StoreError::DecodeSnapshot(Box::new(err)))?
                         .ok_or(StoreError::DecodeSnapshot(Box::new(std::io::Error::new(
@@ -96,43 +254,15 @@ where
                 }
                 PersistenceAction::Journal { path, .. } => {
                     let mut file = File::open(path).await.map_err(StoreError::JournalIO)?;
-                    for command in JournalFile::parse(&self.serializer, &mut file).await? {
-                        inner.state.execute(command);
+                    for command in JournalFile::parse::<S, C>(serializer, &mut file).await? {
+                        self.state.execute(command);
                     }
                 }
             }
         }
         Ok(())
     }
-}
 
-#[derive(Debug, Clone)]
-pub struct StoreOptions {
-    max_journal_entries: NonZeroUsize,
-}
-
-impl StoreOptions {
-    pub fn max_journal_entries(&mut self, value: NonZeroUsize) {
-        self.max_journal_entries = value;
-    }
-}
-
-impl Default for StoreOptions {
-    fn default() -> Self {
-        Self {
-            max_journal_entries: NonZeroUsize::new(16384).unwrap(),
-        }
-    }
-}
-
-struct StoreInner<T> {
-    state: T,
-    dir: PathBuf,
-    next_snapshot_version: SnapshotVersion,
-    journal: JournalFile,
-}
-
-impl<T> StoreInner<T> {
     async fn writable_journal<S>(
         &mut self,
         max_entries: NonZeroUsize,
@@ -141,7 +271,7 @@ impl<T> StoreInner<T> {
     where
         S: Serializer<T>,
     {
-        if self.journal.written_entries >= max_entries.into() || self.journal.file.is_none() {
+        if self.journal.written_entries >= max_entries.into() || self.journal.writer.is_none() {
             self.create_new_journal(serializer).await?;
         }
         Ok(&mut self.journal)
@@ -151,6 +281,10 @@ impl<T> StoreInner<T> {
     where
         S: Serializer<T>,
     {
+        self.journal
+            .flush_and_sync()
+            .await
+            .map_err(StoreError::JournalIO)?;
         self.snapshot(serializer).await?;
         self.journal = JournalFile::open(self.dir.clone(), self.next_snapshot_version).await?;
         Ok(())
@@ -191,7 +325,7 @@ type SnapshotVersion = u32;
 
 #[derive(Debug)]
 struct JournalFile {
-    file: Option<File>,
+    writer: Option<BufWriter<File>>,
     written_entries: usize,
 }
 
@@ -205,32 +339,25 @@ impl JournalFile {
             .await
             .map_err(StoreError::JournalIO)?;
         Ok(Self {
-            file: Some(file),
+            writer: Some(BufWriter::new(file)),
             written_entries: 0,
         })
     }
 
     async fn append(&mut self, command: &[u8]) -> std::io::Result<()> {
-        let file = match &mut self.file {
-            Some(file) => file,
-            None => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "file poisoned",
-                ))
-            }
-        };
-        if let Err(err) = Self::write_data_and_sync(file, command).await {
-            self.file = None;
+        let writer = self.get_writer()?;
+        if let Err(err) = writer.write_all(command).await {
+            self.writer = None;
             return Err(err);
         }
         self.written_entries += 1;
         Ok(())
     }
 
-    async fn write_data_and_sync(file: &mut File, data: &[u8]) -> std::io::Result<()> {
-        file.write_all(data).await?;
-        file.sync_all().await?;
+    async fn flush_and_sync(&mut self) -> std::io::Result<()> {
+        let writer = self.get_writer()?;
+        writer.flush().await?;
+        writer.get_mut().sync_all().await?;
         Ok(())
     }
 
@@ -250,6 +377,16 @@ impl JournalFile {
             commands.push(command);
         }
         Ok(commands)
+    }
+
+    fn get_writer(&mut self) -> std::io::Result<&mut BufWriter<File>> {
+        match &mut self.writer {
+            Some(writer) => Ok(writer),
+            None => Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "file poisoned",
+            )),
+        }
     }
 }
 
