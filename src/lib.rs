@@ -35,18 +35,19 @@ where
         let dir: PathBuf = dir.into();
         fs::create_dir_all(&dir).await.map_err(StoreError::FileIO)?;
         let persistence_actions = PersistenceAction::rebuild(&dir).await?;
-        let recovered_version: SnapshotVersion = persistence_actions
+        let next_snapshot_version: SnapshotVersion = persistence_actions
             .last()
-            .map(|action| action.snapshot_version())
+            .map(|action| match action {
+                PersistenceAction::Snapshot { version, .. } => *version + 1,
+                PersistenceAction::Journal { version, .. } => *version,
+            })
             .unwrap_or_default();
-
-        let next_version = recovered_version + 1;
         let mut store = Self {
             inner: RwLock::new(StoreInner {
                 state: Default::default(),
-                journal: JournalFile::open(&dir, next_version).await?,
+                journal: JournalFile::open(&dir, next_snapshot_version).await?,
                 dir,
-                snapshot_version: next_version,
+                next_snapshot_version,
             }),
             serializer,
             options,
@@ -127,7 +128,7 @@ impl Default for StoreOptions {
 struct StoreInner<T> {
     state: T,
     dir: PathBuf,
-    snapshot_version: SnapshotVersion,
+    next_snapshot_version: SnapshotVersion,
     journal: JournalFile,
 }
 
@@ -151,7 +152,7 @@ impl<T> StoreInner<T> {
         S: Serializer<T>,
     {
         self.snapshot(serializer).await?;
-        self.journal = JournalFile::open(self.dir.clone(), self.snapshot_version).await?;
+        self.journal = JournalFile::open(self.dir.clone(), self.next_snapshot_version).await?;
         Ok(())
     }
 
@@ -166,12 +167,12 @@ impl<T> StoreInner<T> {
             .map_err(|err| StoreError::EncodeSnapshot(Box::new(err)))?;
         fs::write(
             self.dir
-                .join(format!("{:0>10}.snapshot", self.snapshot_version)),
+                .join(format!("{:0>10}.snapshot", self.next_snapshot_version)),
             serialized,
         )
         .await
         .map_err(StoreError::SnapshotIO)?;
-        self.snapshot_version += 1;
+        self.next_snapshot_version += 1;
         Ok(())
     }
 }
@@ -195,12 +196,12 @@ struct JournalFile {
 }
 
 impl JournalFile {
-    pub async fn open(dir: impl Into<PathBuf>, id: SnapshotVersion) -> StoreResult<Self> {
+    pub async fn open(dir: impl Into<PathBuf>, version: SnapshotVersion) -> StoreResult<Self> {
         let dir: PathBuf = dir.into();
         let file = fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(dir.join(format!("{:0>10}.journal", id)))
+            .open(dir.join(format!("{:0>10}.journal", version)))
             .await
             .map_err(StoreError::JournalIO)?;
         Ok(Self {
@@ -254,12 +255,13 @@ impl JournalFile {
 
 enum PersistenceAction {
     Snapshot {
-        snapshot_version: SnapshotVersion,
+        version: SnapshotVersion,
         path: PathBuf,
     },
     Journal {
-        // Version of data snapshot which may not exist yet.
-        snapshot_version: SnapshotVersion,
+        /// A version of data snapshot that may not yet exist due to
+        /// an journal being incomplete.
+        version: SnapshotVersion,
         path: PathBuf,
     },
 }
@@ -278,23 +280,20 @@ impl PersistenceAction {
     async fn rebuild(dir_path: impl AsRef<Path>) -> StoreResult<Vec<PersistenceAction>> {
         let mut actions = Self::read_dir(&dir_path).await?;
         actions.sort_by_key(|action| action.snapshot_version());
-        let latest_snapshot_id = actions
+        let latest_version = actions
             .iter()
             .filter_map(|action| match action {
                 PersistenceAction::Snapshot {
-                    snapshot_version, ..
+                    version: snapshot_version,
+                    ..
                 } => Some(*snapshot_version),
                 _ => None,
             })
             .last();
-        if let Some(latest_snapshot_id) = latest_snapshot_id {
+        if let Some(latest_version) = latest_version {
             actions.retain(|action| match action {
-                PersistenceAction::Journal {
-                    snapshot_version, ..
-                } => *snapshot_version > latest_snapshot_id,
-                PersistenceAction::Snapshot {
-                    snapshot_version, ..
-                } => *snapshot_version == latest_snapshot_id,
+                PersistenceAction::Journal { version, .. } => *version > latest_version,
+                PersistenceAction::Snapshot { version, .. } => *version == latest_version,
             });
         }
         Ok(actions)
@@ -306,7 +305,7 @@ impl PersistenceAction {
         let mut read_dir = fs::read_dir(&path).await.map_err(StoreError::JournalIO)?;
         while let Some(entry) = read_dir.next_entry().await.map_err(StoreError::JournalIO)? {
             let entry_path = entry.path();
-            let action_id = entry_path
+            let version = entry_path
                 .file_stem()
                 .and_then(OsStr::to_str)
                 .and_then(|path| path.parse::<SnapshotVersion>().ok())
@@ -316,13 +315,13 @@ impl PersistenceAction {
             match entry_path.extension() {
                 Some(extension) if extension == "journal" => {
                     actions.push(PersistenceAction::Journal {
-                        snapshot_version: action_id,
+                        version,
                         path: entry_path,
                     });
                 }
                 Some(extension) if extension == "snapshot" => {
                     actions.push(PersistenceAction::Snapshot {
-                        snapshot_version: action_id,
+                        version,
                         path: entry_path,
                     });
                 }
@@ -334,12 +333,8 @@ impl PersistenceAction {
 
     fn snapshot_version(&self) -> u32 {
         match self {
-            PersistenceAction::Snapshot {
-                snapshot_version, ..
-            } => *snapshot_version,
-            PersistenceAction::Journal {
-                snapshot_version, ..
-            } => *snapshot_version,
+            PersistenceAction::Snapshot { version, .. } => *version,
+            PersistenceAction::Journal { version, .. } => *version,
         }
     }
 }
@@ -432,11 +427,36 @@ mod tests {
         let store: Store<Counter, _> = Store::open(JsonSerializer, options, dir.path())
             .await
             .unwrap();
-        let first_ver = store.inner.read().await.snapshot_version;
+        let first_ver = store.inner.read().await.next_snapshot_version;
         store.commit(CounterCommand::Increase).await.unwrap();
         store.commit(CounterCommand::Increase).await.unwrap();
-        assert_eq!(store.inner.read().await.snapshot_version, first_ver);
+        assert_eq!(store.inner.read().await.next_snapshot_version, first_ver);
         store.commit(CounterCommand::Increase).await.unwrap();
-        assert_eq!(store.inner.read().await.snapshot_version, first_ver + 1);
+        assert_eq!(
+            store.inner.read().await.next_snapshot_version,
+            first_ver + 1
+        );
+    }
+
+    #[tokio::test]
+    async fn test_retake_unfulfilled_journal_on_recovery() {
+        let dir = tempdir().unwrap();
+        let mut options = StoreOptions::default();
+        options.max_journal_entries(NonZeroUsize::new(10).unwrap());
+
+        let first_ver = {
+            let store: Store<Counter, _> = Store::open(JsonSerializer, options.clone(), dir.path())
+                .await
+                .unwrap();
+            store.commit(CounterCommand::Increase).await.unwrap();
+            let ver = store.inner.read().await.next_snapshot_version;
+            ver
+        };
+
+        let store: Store<Counter, _> = Store::open(JsonSerializer, options, dir.path())
+            .await
+            .unwrap();
+        store.commit(CounterCommand::Increase).await.unwrap();
+        assert_eq!(store.inner.read().await.next_snapshot_version, first_ver);
     }
 }
