@@ -175,6 +175,7 @@ impl StoreOptions {
     }
 
     /// Should [Store] synchronously [Store::flush_and_sync] on [Store::drop]?
+    /// NO-OP when using [Self::journal_flush_policy] with value [JournalFlushPolicy::EveryCommit].
     pub fn flush_synchronously_on_drop(mut self, value: bool) -> Self {
         self.flush_synchronously_on_drop = value;
         self
