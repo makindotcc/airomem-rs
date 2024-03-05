@@ -364,7 +364,7 @@ impl JournalFile {
     async fn flush_and_sync(&mut self) -> std::io::Result<()> {
         let writer = self.get_writer()?;
         writer.flush().await?;
-        writer.get_mut().sync_all().await?;
+        writer.get_mut().sync_data().await?;
         Ok(())
     }
 
