@@ -357,7 +357,15 @@ impl JournalFile {
     }
 
     async fn append(&mut self, command: &[u8]) -> std::io::Result<()> {
-        let writer = self.get_writer()?;
+        let writer = match &mut self.writer {
+            Some(writer) => writer,
+            None => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "file poisoned",
+                ))
+            }
+        };
         if let Err(err) = writer.write_all(command).await {
             self.writer = None;
             return Err(err);
@@ -367,8 +375,7 @@ impl JournalFile {
     }
 
     async fn flush_and_sync(&mut self) -> std::io::Result<()> {
-        let writer = self.get_writer()?;
-        if !writer.buffer().is_empty() {
+        if let Some(writer) = &mut self.writer {
             writer.flush().await?;
             writer.get_mut().sync_data().await?;
         }
@@ -391,16 +398,6 @@ impl JournalFile {
             commands.push(command);
         }
         Ok(commands)
-    }
-
-    fn get_writer(&mut self) -> std::io::Result<&mut BufWriter<File>> {
-        match &mut self.writer {
-            Some(writer) => Ok(writer),
-            None => Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "file poisoned",
-            )),
-        }
     }
 }
 
