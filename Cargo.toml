@@ -1,6 +1,6 @@
 [package]
 name = "airomem"
-version = "0.1.8"
+version = "0.1.9"
 edition = "2021"
 repository = "https://github.com/makindotcc/airomem-rs"
 categories = ["database-implementations"]
