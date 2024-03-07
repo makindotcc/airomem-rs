@@ -100,7 +100,24 @@ where
 
     /// Returns immutable, read only store data.
     /// While [QueryGuard] is not dropped, any store updates are locked.
-    pub async fn query(&self) -> QueryGuard<'_, T> {
+    ///
+    /// Takes mutable reference to prevent some kind of deadlocks e.g.
+    /// Committing command, while holding still [QueryGuard] in one, single threaded function.
+    /// ```rust,compile_fail
+    /// #[derive(Default, serde::Serialize, serde::Deserialize)]
+    /// struct Counter { count: usize }
+    /// impl airomem::State for Counter {
+    ///     type Command = ();
+    ///     fn execute(&mut self, command: Self::Command) {
+    ///         self.count += 1;
+    ///     }
+    /// }
+    /// async fn request_handler(mut store: airomem::JsonStore<Counter>) -> airomem::StoreResult<()> {
+    ///     let read_locked = store.query().await; // mutable borrow occurs here
+    ///     store.commit(()).await // immutable borrow occurs here, compilation fails
+    /// }
+    /// ```
+    pub async fn query(&mut self) -> QueryGuard<'_, T> {
         QueryGuard(self.inner.read().await)
     }
 

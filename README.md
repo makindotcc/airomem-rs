@@ -59,7 +59,7 @@ enum SessionsCommand {
 #[tokio::test]
 async fn test_mem_commit() {
     let dir = tempdir().unwrap();
-    let store: SessionsStore =
+    let mut store: SessionsStore =
         Store::open(JsonSerializer, StoreOptions::default(), dir.into_path())
             .await
             .unwrap();
