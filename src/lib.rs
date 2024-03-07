@@ -19,14 +19,12 @@ pub mod error;
 
 pub type JsonStore<D> = Store<D, JsonSerializer>;
 
-pub struct Store<T, S>
-where
-    T: State,
-{
-    inner: SharedStoreInner<T>,
-    serializer: S,
-    options: StoreOptions,
-    _flush_guard: Option<FlushGuard>,
+pub struct Store<T: State, S>(Arc<StoreInner<T, S>>);
+
+impl<T: State, S> Clone for Store<T, S> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
 }
 
 impl<T, S> Store<T, S>
@@ -52,23 +50,29 @@ where
                 PersistenceAction::Journal { version, .. } => *version,
             })
             .unwrap_or_default();
-        let inner = Arc::new(RwLock::new({
-            let mut inner = StoreInner::new(dir, next_snapshot_version).await?;
-            inner.rebuild(&serializer, persistence_actions).await?;
-            inner
+        let persistent = Arc::new(RwLock::new({
+            let flush_on_drop = options.flush_synchronously_on_drop
+                && !matches!(
+                    options.journal_flush_policy,
+                    JournalFlushPolicy::EveryCommit
+                );
+            let mut persistent =
+                PersistentState::new(dir, next_snapshot_version, flush_on_drop).await?;
+            persistent.rebuild(&serializer, persistence_actions).await?;
+            persistent
         }));
-        let flush_guard = match options.journal_flush_policy {
+        let _flusher_guard = match options.journal_flush_policy {
             JournalFlushPolicy::EveryCommit | JournalFlushPolicy::Manually => None,
             JournalFlushPolicy::Every(interval) => {
-                Some(Self::start_flusher(interval, Arc::clone(&inner)))
+                Some(Self::start_flusher(interval, Arc::clone(&persistent)))
             }
         };
-        Ok(Self {
-            inner,
+        Ok(Self(Arc::new(StoreInner {
+            persistent,
             serializer,
             options,
-            _flush_guard: flush_guard,
-        })
+            _flusher_guard,
+        })))
     }
 
     /// Persists [State::Command] to file(s) and executes it on [State].
@@ -78,26 +82,27 @@ where
         T: State<Command = C> + Sync + Send + 'static,
         S: Serializer<C> + Serializer<T>,
     {
-        let serialized: Vec<u8> = self
+        let inner = &self.0;
+        let serialized: Vec<u8> = inner
             .serializer
             .serialize(&command)
             .map_err(|err| StoreError::EncodeJournalEntry(err.into()))?;
-        let mut inner = self.inner.write().await;
-        let journal_file = inner
-            .writable_journal(self.options.max_journal_entries, &self.serializer)
+        let mut persistent = inner.persistent.write().await;
+        let journal_file = persistent
+            .writable_journal(inner.options.max_journal_entries, &inner.serializer)
             .await?;
         journal_file
             .append(&serialized)
             .await
             .map_err(StoreError::JournalIO)?;
-        if let JournalFlushPolicy::EveryCommit = self.options.journal_flush_policy {
+        if let JournalFlushPolicy::EveryCommit = inner.options.journal_flush_policy {
             journal_file
                 .flush_and_sync()
                 .await
                 .map_err(StoreError::JournalIO)?;
         }
-        inner.state.execute(command);
-        Ok(QueryGuard(inner.downgrade()))
+        persistent.state.execute(command);
+        Ok(QueryGuard(persistent.downgrade()))
     }
 
     /// Returns immutable, read only store data.
@@ -115,36 +120,37 @@ where
     ///     }
     /// }
     /// async fn request_handler(mut store: airomem::JsonStore<Counter>) -> airomem::StoreResult<()> {
-    ///     let read_locked = store.query().await; // mutable borrow occurs here
-    ///     store.commit(()).await // immutable borrow occurs here, compilation fails
+    ///     let read_locked = store.query().await; // first mutable borrow occurs here
+    ///     store.commit(()).await // second mutable borrow occurs here, compilation fails
+    ///                            // (cannot borrow `store` as mutable more than once at a time)
     /// }
     /// ```
     pub async fn query(&mut self) -> QueryGuard<'_, T> {
-        QueryGuard(self.inner.read().await)
+        QueryGuard(self.0.persistent.read().await)
     }
 
-    /// Flushes buffered commands to file and synces it using [File::sync_all].
+    /// Flushes buffered commands to file and synces it using [File::sync_data].
     pub async fn flush_and_sync(&self) -> StoreResult<()> {
-        self.inner
+        self.0
+            .persistent
             .write()
             .await
             .journal
             .flush_and_sync()
             .await
-            .map_err(StoreError::JournalIO)?;
-        Ok(())
+            .map_err(StoreError::JournalIO)
     }
 
-    fn start_flusher<C>(interval: Duration, inner: SharedStoreInner<T>) -> FlushGuard
+    fn start_flusher<C>(interval: Duration, persistent: SharedPersistentState<T>) -> FlusherGuard
     where
         T: State<Command = C> + Sync + Send + 'static,
         S: Serializer<C>,
     {
-        FlushGuard(tokio::spawn(async move {
+        FlusherGuard(tokio::spawn(async move {
             loop {
                 sleep(interval).await;
-                let mut inner = inner.write().await;
-                if let Err(err) = inner.journal.flush_and_sync().await {
+                let mut persistent = persistent.write().await;
+                if let Err(err) = persistent.journal.flush_and_sync().await {
                     eprintln!("Could not flush journal log: {err:?}");
                 }
             }
@@ -152,24 +158,14 @@ where
     }
 }
 
-impl<T, S> Drop for Store<T, S>
+struct StoreInner<T, S>
 where
     T: State,
 {
-    fn drop(&mut self) {
-        if self.options.flush_synchronously_on_drop
-            && !matches!(
-                self.options.journal_flush_policy,
-                JournalFlushPolicy::EveryCommit
-            )
-        {
-            futures::executor::block_on(async move {
-                if let Err(err) = self.flush_and_sync().await {
-                    eprintln!("Could not flush journal log on drop: {err:?}");
-                };
-            });
-        }
-    }
+    persistent: SharedPersistentState<T>,
+    serializer: S,
+    options: StoreOptions,
+    _flusher_guard: Option<FlusherGuard>,
 }
 
 #[derive(Debug, Clone)]
@@ -224,28 +220,33 @@ pub enum JournalFlushPolicy {
     Manually,
 }
 
-struct FlushGuard(JoinHandle<Infallible>);
+struct FlusherGuard(JoinHandle<Infallible>);
 
-impl Drop for FlushGuard {
+impl Drop for FlusherGuard {
     fn drop(&mut self) {
         self.0.abort();
     }
 }
 
-type SharedStoreInner<T> = Arc<RwLock<StoreInner<T>>>;
+type SharedPersistentState<T> = Arc<RwLock<PersistentState<T>>>;
 
-struct StoreInner<T> {
+struct PersistentState<T> {
     state: T,
     dir: PathBuf,
     next_snapshot_version: SnapshotVersion,
     journal: JournalFile,
+    flush_on_drop: bool,
 }
 
-impl<T> StoreInner<T>
+impl<T> PersistentState<T>
 where
     T: State,
 {
-    async fn new(dir: PathBuf, next_snapshot_version: SnapshotVersion) -> StoreResult<Self>
+    async fn new(
+        dir: PathBuf,
+        next_snapshot_version: SnapshotVersion,
+        flush_on_drop: bool,
+    ) -> StoreResult<Self>
     where
         T: Default,
     {
@@ -254,6 +255,7 @@ where
             journal: JournalFile::open(&dir, next_snapshot_version).await?,
             dir,
             next_snapshot_version,
+            flush_on_drop,
         })
     }
 
@@ -343,7 +345,19 @@ where
     }
 }
 
-pub struct QueryGuard<'a, T>(RwLockReadGuard<'a, StoreInner<T>>);
+impl<T> Drop for PersistentState<T> {
+    fn drop(&mut self) {
+        if self.flush_on_drop {
+            futures::executor::block_on(async move {
+                if let Err(err) = self.journal.flush_and_sync().await {
+                    eprintln!("Could not flush journal log on drop: {err:?}");
+                };
+            });
+        }
+    }
+}
+
+pub struct QueryGuard<'a, T>(RwLockReadGuard<'a, PersistentState<T>>);
 
 impl<'a, T> Deref for QueryGuard<'a, T> {
     type Target = T;
@@ -594,13 +608,16 @@ mod tests {
         let mut store: Store<Counter, _> = Store::open(JsonSerializer, options, dir.path())
             .await
             .unwrap();
-        let first_ver = store.inner.read().await.next_snapshot_version;
+        let first_ver = store.0.persistent.read().await.next_snapshot_version;
         store.commit(CounterCommand::Increase).await.unwrap();
-        store.commit(CounterCommand::Increase).await.unwrap();
-        assert_eq!(store.inner.read().await.next_snapshot_version, first_ver);
         store.commit(CounterCommand::Increase).await.unwrap();
         assert_eq!(
-            store.inner.read().await.next_snapshot_version,
+            store.0.persistent.read().await.next_snapshot_version,
+            first_ver
+        );
+        store.commit(CounterCommand::Increase).await.unwrap();
+        assert_eq!(
+            store.0.persistent.read().await.next_snapshot_version,
             first_ver + 1
         );
     }
@@ -610,11 +627,12 @@ mod tests {
         let dir = tempdir().unwrap();
         let options = StoreOptions::default().max_journal_entries(NonZeroUsize::new(10).unwrap());
         let first_ver = {
-            let mut store: Store<Counter, _> = Store::open(JsonSerializer, options.clone(), dir.path())
-                .await
-                .unwrap();
+            let mut store: Store<Counter, _> =
+                Store::open(JsonSerializer, options.clone(), dir.path())
+                    .await
+                    .unwrap();
             store.commit(CounterCommand::Increase).await.unwrap();
-            let ver = store.inner.read().await.next_snapshot_version;
+            let ver = store.0.persistent.read().await.next_snapshot_version;
             ver
         };
 
@@ -622,6 +640,9 @@ mod tests {
             .await
             .unwrap();
         store.commit(CounterCommand::Increase).await.unwrap();
-        assert_eq!(store.inner.read().await.next_snapshot_version, first_ver);
+        assert_eq!(
+            store.0.persistent.read().await.next_snapshot_version,
+            first_ver
+        );
     }
 }

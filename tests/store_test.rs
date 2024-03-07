@@ -77,9 +77,10 @@ async fn test_manual_flush() {
                 .flush_synchronously_on_drop(false),
         )
         .await;
-        let mut store: SessionsStore = Store::open(JsonSerializer, StoreOptions::default(), dir.path())
-            .await
-            .unwrap();
+        let mut store: SessionsStore =
+            Store::open(JsonSerializer, StoreOptions::default(), dir.path())
+                .await
+                .unwrap();
         assert_eq!(
             store.query().await.tokens.len(),
             0,
@@ -94,9 +95,10 @@ async fn test_manual_flush() {
                 .flush_synchronously_on_drop(true),
         )
         .await;
-        let mut store: SessionsStore = Store::open(JsonSerializer, StoreOptions::default(), dir.path())
-            .await
-            .unwrap();
+        let mut store: SessionsStore =
+            Store::open(JsonSerializer, StoreOptions::default(), dir.path())
+                .await
+                .unwrap();
         assert_eq!(
             store.query().await.tokens.len(),
             1,
