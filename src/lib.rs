@@ -71,7 +71,9 @@ where
         })
     }
 
-    pub async fn commit<'a, C>(&self, command: C) -> StoreResult<()>
+    /// Persists [State::Command] to file(s) and executes it on [State].
+    /// Returns [QueryGuard] and holds any store updates until dropped.
+    pub async fn commit<C>(&mut self, command: C) -> StoreResult<QueryGuard<'_, T>>
     where
         T: State<Command = C> + Sync + Send + 'static,
         S: Serializer<C> + Serializer<T>,
@@ -95,7 +97,7 @@ where
                 .map_err(StoreError::JournalIO)?;
         }
         inner.state.execute(command);
-        Ok(())
+        Ok(QueryGuard(inner.downgrade()))
     }
 
     /// Returns immutable, read only store data.
@@ -589,7 +591,7 @@ mod tests {
     async fn test_journal_chunking() {
         let dir = tempdir().unwrap();
         let options = StoreOptions::default().max_journal_entries(NonZeroUsize::new(2).unwrap());
-        let store: Store<Counter, _> = Store::open(JsonSerializer, options, dir.path())
+        let mut store: Store<Counter, _> = Store::open(JsonSerializer, options, dir.path())
             .await
             .unwrap();
         let first_ver = store.inner.read().await.next_snapshot_version;
@@ -608,7 +610,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let options = StoreOptions::default().max_journal_entries(NonZeroUsize::new(10).unwrap());
         let first_ver = {
-            let store: Store<Counter, _> = Store::open(JsonSerializer, options.clone(), dir.path())
+            let mut store: Store<Counter, _> = Store::open(JsonSerializer, options.clone(), dir.path())
                 .await
                 .unwrap();
             store.commit(CounterCommand::Increase).await.unwrap();
@@ -616,7 +618,7 @@ mod tests {
             ver
         };
 
-        let store: Store<Counter, _> = Store::open(JsonSerializer, options, dir.path())
+        let mut store: Store<Counter, _> = Store::open(JsonSerializer, options, dir.path())
             .await
             .unwrap();
         store.commit(CounterCommand::Increase).await.unwrap();
