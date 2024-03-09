@@ -12,7 +12,7 @@ macro_rules! NestedTx {
                     $(#[$m:meta])* 
                     $field_name:ident : $field_type:ty
                 ),* $(,)?
-            ) -> $return_type:ty: $tx_fn:expr
+            ) -> $return_type:ty = $tx_fn:expr
         ),* $(,)?
     }) => {
         #[derive(serde::Serialize, serde::Deserialize)]

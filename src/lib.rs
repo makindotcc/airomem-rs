@@ -588,11 +588,11 @@ mod tests {
     }
 
     NestedTx!(CounterTx<Counter> {
-        Increase () -> (): |data: &mut Counter, _| {
+        Increase () -> () = |data: &mut Counter, _| {
             data.value += 1;
         },
-        IncreaseBy (by: usize) -> usize: Counter::increase_by,
-        DecreaseBy (by: usize, and: usize) -> usize: |data: &mut Counter, tx: DecreaseBy| {
+        IncreaseBy (by: usize) -> usize = Counter::increase_by,
+        DecreaseBy (by: usize, and: usize) -> usize = |data: &mut Counter, tx: DecreaseBy| {
             data.value -= tx.by - tx.and;
             data.value
         },

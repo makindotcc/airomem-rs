@@ -16,14 +16,14 @@ struct Sessions {
 // ``Sessions`` - data struct name, used in closure
 NestedTx!(SessionsTx<Sessions> {
     // ``-> ()`` is return type unit (aka no value)
-    CreateSession (token: String, user_id: UserId, #[serde(skip)] ignored: usize) -> (): |data: &mut Sessions, tx: CreateSession| {
+    CreateSession (token: String, user_id: UserId, #[serde(skip)] ignored: usize) -> () = |data: &mut Sessions, tx: CreateSession| {
         data.operations += 1;
         data.tokens.insert(tx.token, tx.user_id);
     },
     // ``DeleteSession`` - your desired name for sub-tx struct implementation.
     // ``token: String, user_id: UserId`` - variables for ``DeleteSession`` struct
     // ``Option<UserId>`` - return type from closure, used to return data from store.commit(DeleteSession { ... })...
-    DeleteSession (token: String) -> Option<UserId>: |data: &mut Sessions, tx: DeleteSession| {
+    DeleteSession (token: String) -> Option<UserId> = |data: &mut Sessions, tx: DeleteSession| {
         data.operations += 1;
         data.tokens.remove(&tx.token)
     },
