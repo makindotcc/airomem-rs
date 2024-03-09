@@ -1,37 +1,33 @@
-use airomem::{JournalFlushPolicy, JsonSerializer, JsonStore, Store, StoreOptions};
+use airomem::{JournalFlushPolicy, JsonSerializer, JsonStore, NestedTx, Store, StoreOptions};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, num::NonZeroUsize};
 use tempfile::tempdir;
 
-type SessionsStore = JsonStore<Sessions>;
+type UserId = usize;
+type SessionsStore = JsonStore<Sessions, SessionsTx>;
 
-#[derive(Serialize, Deserialize, Default, Debug)]
+#[derive(Serialize, Deserialize, Default)]
 struct Sessions {
-    tokens: HashMap<String, usize>,
+    tokens: HashMap<String, UserId>,
     operations: usize,
 }
 
-impl airomem::State for Sessions {
-    type Command = SessionsCommand;
-
-    fn execute(&mut self, command: SessionsCommand) {
-        self.operations += 1;
-        match command {
-            SessionsCommand::CreateSession { token, user_id } => {
-                self.tokens.insert(token, user_id);
-            }
-            SessionsCommand::DeleteSession { token } => {
-                self.tokens.remove(&token);
-            }
-        }
-    }
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-enum SessionsCommand {
-    CreateSession { token: String, user_id: usize },
-    DeleteSession { token: String },
-}
+// ``SessionsTx`` - your desired name for root Tx name. It implements enum ``SessionsTx`` under the hood.
+// ``Sessions`` - data struct name, used in closure
+NestedTx!(SessionsTx<Sessions> {
+    // ``-> ()`` is return type unit (aka no value)
+    CreateSession (token: String, user_id: UserId) -> (): |data: &mut Sessions, tx: CreateSession| {
+        data.operations += 1;
+        data.tokens.insert(tx.token, tx.user_id);
+    },
+    // ``DeleteSession`` - your desired name for sub-tx struct implementation.
+    // ``token: String, user_id: UserId`` - variables for ``DeleteSession`` struct
+    // ``Option<UserId>`` - return type from closure, used to return data from store.commit(DeleteSession { ... })...
+    DeleteSession (token: String) -> Option<UserId>: |data: &mut Sessions, tx: DeleteSession| {
+        data.operations += 1;
+        data.tokens.remove(&tx.token)
+    },
+});
 
 #[tokio::test]
 async fn test_mem_commit() {
@@ -40,17 +36,27 @@ async fn test_mem_commit() {
         Store::open(JsonSerializer, StoreOptions::default(), dir.into_path())
             .await
             .unwrap();
+    let example_token = "access_token".to_string();
+    let example_uid = 1;
     store
-        .commit(SessionsCommand::CreateSession {
-            token: "access_token".to_string(),
-            user_id: 1,
+        .commit(CreateSession {
+            token: example_token.clone(),
+            user_id: example_uid,
         })
         .await
         .unwrap();
 
     let mut expected_tokens = HashMap::new();
-    expected_tokens.insert("access_token".to_string(), 1);
+    expected_tokens.insert(example_token.clone(), example_uid);
     assert_eq!(store.query().await.tokens, expected_tokens);
+
+    let deleted_uid = store
+        .commit(DeleteSession {
+            token: example_token,
+        })
+        .await
+        .unwrap();
+    assert_eq!(deleted_uid, Some(example_uid));
 }
 
 #[tokio::test]
@@ -61,7 +67,7 @@ async fn test_manual_flush() {
         async move {
             let mut store: SessionsStore = Store::open(JsonSerializer, options, dir).await.unwrap();
             store
-                .commit(SessionsCommand::CreateSession {
+                .commit(CreateSession {
                     token: "access_token".to_string(),
                     user_id: 1,
                 })
@@ -77,10 +83,9 @@ async fn test_manual_flush() {
                 .flush_synchronously_on_drop(false),
         )
         .await;
-        let mut store: SessionsStore =
-            Store::open(JsonSerializer, StoreOptions::default(), dir.path())
-                .await
-                .unwrap();
+        let store: SessionsStore = Store::open(JsonSerializer, StoreOptions::default(), dir.path())
+            .await
+            .unwrap();
         assert_eq!(
             store.query().await.tokens.len(),
             0,
@@ -95,10 +100,9 @@ async fn test_manual_flush() {
                 .flush_synchronously_on_drop(true),
         )
         .await;
-        let mut store: SessionsStore =
-            Store::open(JsonSerializer, StoreOptions::default(), dir.path())
-                .await
-                .unwrap();
+        let store: SessionsStore = Store::open(JsonSerializer, StoreOptions::default(), dir.path())
+            .await
+            .unwrap();
         assert_eq!(
             store.query().await.tokens.len(),
             1,
@@ -116,14 +120,14 @@ async fn test_journal_rebuild() {
             .await
             .unwrap();
         store
-            .commit(SessionsCommand::CreateSession {
+            .commit(CreateSession {
                 token: format!("token{i}"),
                 user_id: i,
             })
             .await
             .unwrap();
     }
-    let mut store: SessionsStore = Store::open(JsonSerializer, options, dir.into_path())
+    let store: SessionsStore = Store::open(JsonSerializer, options, dir.into_path())
         .await
         .unwrap();
     let expected_tokens = {
@@ -146,7 +150,7 @@ async fn test_rebuild_with_snapshot() {
                 .unwrap();
             for i in 0..commits {
                 store
-                    .commit(SessionsCommand::CreateSession {
+                    .commit(CreateSession {
                         token: format!("token{i}"),
                         user_id: i,
                     })
@@ -154,7 +158,7 @@ async fn test_rebuild_with_snapshot() {
                     .unwrap();
             }
         }
-        let mut store: SessionsStore = Store::open(JsonSerializer, options.clone(), dir.path())
+        let store: SessionsStore = Store::open(JsonSerializer, options.clone(), dir.path())
             .await
             .unwrap();
         let expected_tokens = {

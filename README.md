@@ -8,7 +8,7 @@
 ## Assumptions
 
 - All data lives in memory guarded with `tokio::sync::RwLock`, reads are fast and concurrent safe.
-- By default every command is saved to append-only journal file and immediately [fsynced](https://man7.org/linux/man-pages/man2/fsync.2.html).
+- By default every transaction is saved to append-only journal file and immediately [fsynced](https://man7.org/linux/man-pages/man2/fsync.2.html).
   By that, individual writes are slow, but they SHOULD survive crashes (e.g. power outage, software panic). \
   However, you can set periodic sync or manual. See `JournalFlushPolicy` for more info.
   Recommended for data that may be lost (e.g. cache, http session storage).
@@ -16,9 +16,10 @@
 
 ## Features
 
-- [x] - saving executed commands to append only file
+- [x] - saving executed transactions to append only file
 - [x] - split journal log file if too big - while restoring data, all journal logs are loaded at once from disk to maximise throughput (and for simplicity reasons)
 - [x] - snapshots for faster recovery
+- [ ] - stable api
 
 ## Resources
 
@@ -28,33 +29,31 @@
 ## Example
 
 ```rust
-type SessionsStore = JsonStore<Sessions>;
+type UserId = usize;
+type SessionsStore = JsonStore<Sessions, SessionsTx>;
 
-#[derive(Serialize, Deserialize, Default, Debug)]
+#[derive(Serialize, Deserialize, Default)]
 struct Sessions {
-    tokens: HashMap<String, usize>,
+    tokens: HashMap<String, UserId>,
+    operations: usize,
 }
 
-impl airomem::State for Sessions {
-    type Command = SessionsCommand;
-
-    fn execute(&mut self, command: SessionsCommand) {
-        match command {
-            SessionsCommand::CreateSession { token, user_id } => {
-                self.tokens.insert(token, user_id);
-            }
-            SessionsCommand::DeleteSession { token } => {
-                self.tokens.remove(&token);
-            }
-        }
-    }
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-enum SessionsCommand {
-    CreateSession { token: String, user_id: usize },
-    DeleteSession { token: String },
-}
+// ``SessionsTx`` - your desired name for root Tx name. It implements enum ``SessionsTx`` under the hood.
+// ``Sessions`` - data struct name, used in closure
+NestedTx!(SessionsTx<Sessions> {
+    // ``-> ()`` is return type unit (aka no value)
+    CreateSession (token: String, user_id: UserId) -> (): |data: &mut Sessions, tx: CreateSession| {
+        data.operations += 1;
+        data.tokens.insert(tx.token, tx.user_id);
+    },
+    // ``DeleteSession`` - your desired name for sub-tx struct implementation.
+    // ``token: String, user_id: UserId`` - variables for ``DeleteSession`` struct
+    // ``Option<UserId>`` - return type from closure, used to return data from store.commit(DeleteSession { ... })...
+    DeleteSession (token: String) -> Option<UserId>: |data: &mut Sessions, tx: DeleteSession| {
+        data.operations += 1;
+        data.tokens.remove(&tx.token)
+    },
+});
 
 #[tokio::test]
 async fn test_mem_commit() {
@@ -63,16 +62,86 @@ async fn test_mem_commit() {
         Store::open(JsonSerializer, StoreOptions::default(), dir.into_path())
             .await
             .unwrap();
+    let example_token = "access_token".to_string();
+    let example_uid = 1;
     store
-        .commit(SessionsCommand::CreateSession {
-            token: "access_token".to_string(),
-            user_id: 1,
+        .commit(CreateSession {
+            token: example_token.clone(),
+            user_id: example_uid,
         })
         .await
         .unwrap();
 
     let mut expected_tokens = HashMap::new();
-    expected_tokens.insert("access_token".to_string(), 1);
+    expected_tokens.insert(example_token.clone(), example_uid);
     assert_eq!(store.query().await.tokens, expected_tokens);
+
+    let deleted_uid = store
+        .commit(DeleteSession {
+            token: example_token,
+        })
+        .await
+        .unwrap();
+    assert_eq!(deleted_uid, Some(example_uid));
+}
+
+// No macro ``NestedTx!`` equivalent:
+mod no_nested_tx_macro {
+    #[derive(serde::Serialize, serde::Deserialize)]
+    pub enum SessionsTx {
+        CreateSession(CreateSession),
+        DeleteSession(DeleteSession),
+    }
+
+    #[derive(serde::Serialize, serde::Deserialize)]
+    pub struct CreateSession {
+        token: String,
+        user_id: UserId,
+    }
+
+    impl Into<SessionsTx> for CreateSession {
+        fn into(self) -> SessionsTx {
+            SessionsTx::CreateSession(self)
+        }
+    }
+
+    impl From<SessionsTx> for CreateSession {
+        fn from(value: SessionsTx) -> Self {
+            match value {
+                SessionsTx::CreateSession(inner) => inner,
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    #[derive(serde::Serialize, serde::Deserialize)]
+    pub struct DeleteSession {
+        token: String,
+    }
+
+    // macro implementing `Into` and `From` like we have done it above manually for CreateSession
+    airomem::EnumBorrowOwned!(SessionsTx, DeleteSession);
+
+    impl Tx<Sessions, ()> for SessionsTx {
+        fn execute(self, data: &mut Sessions) -> () {
+            match self {
+                SessionsTx::CreateSession(it) => {
+                    it.execute(data);
+                }
+                SessionsTx::DeleteSession(it) => {
+                    it.execute(data);
+                }
+            }
+        }
+    }
+
+    impl Tx<Sessions, usize> for DeleteSession {
+        fn execute(self, data: &mut Sessions) -> usize {
+            data.operations += 1;
+            data.tokens.remove(&self.token)
+        }
+    }
+
+    // impl Tx for CreateSession (...)
 }
 ```
