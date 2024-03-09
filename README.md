@@ -28,33 +28,25 @@
 ## Example
 
 ```rust
-type SessionsStore = JsonStore<Sessions>;
+type UserId = usize;
+type SessionsStore = JsonStore<Sessions, SessionsTx>;
 
 #[derive(Serialize, Deserialize, Default, Debug)]
 struct Sessions {
-    tokens: HashMap<String, usize>,
+    tokens: HashMap<String, UserId>,
+    operations: usize,
 }
 
-impl airomem::State for Sessions {
-    type Command = SessionsCommand;
-
-    fn execute(&mut self, command: SessionsCommand) {
-        match command {
-            SessionsCommand::CreateSession { token, user_id } => {
-                self.tokens.insert(token, user_id);
-            }
-            SessionsCommand::DeleteSession { token } => {
-                self.tokens.remove(&token);
-            }
-        }
-    }
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-enum SessionsCommand {
-    CreateSession { token: String, user_id: usize },
-    DeleteSession { token: String },
-}
+NestedTx!(SessionsTx<Sessions> {
+    CreateSession (token: String, user_id: UserId) -> (): |data: &mut Sessions, tx: CreateSession| {
+        data.operations += 1;
+        data.tokens.insert(tx.token, tx.user_id);
+    },
+    DeleteSession (token: String) -> Option<UserId>: |data: &mut Sessions, tx: DeleteSession| {
+        data.operations += 1;
+        data.tokens.remove(&tx.token)
+    },
+});
 
 #[tokio::test]
 async fn test_mem_commit() {
@@ -63,16 +55,26 @@ async fn test_mem_commit() {
         Store::open(JsonSerializer, StoreOptions::default(), dir.into_path())
             .await
             .unwrap();
+    let example_token = "access_token".to_string();
+    let example_uid = 1;
     store
-        .commit(SessionsCommand::CreateSession {
-            token: "access_token".to_string(),
-            user_id: 1,
+        .commit(CreateSession {
+            token: example_token.clone(),
+            user_id: example_uid,
         })
         .await
         .unwrap();
 
     let mut expected_tokens = HashMap::new();
-    expected_tokens.insert("access_token".to_string(), 1);
+    expected_tokens.insert(example_token.clone(), example_uid);
     assert_eq!(store.query().await.tokens, expected_tokens);
+
+    let deleted_uid = store
+        .commit(DeleteSession {
+            token: example_token,
+        })
+        .await
+        .unwrap();
+    assert_eq!(deleted_uid, Some(example_uid));
 }
 ```

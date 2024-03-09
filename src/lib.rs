@@ -17,7 +17,7 @@ use tokio::task::JoinHandle;
 use tokio::time::sleep;
 
 pub mod error;
-pub mod foo;
+pub mod nested_tx;
 
 pub type JsonStore<D, T> = Store<D, T, JsonSerializer>;
 
@@ -529,7 +529,7 @@ impl PersistenceAction {
 }
 
 pub trait Tx<D, R = ()> {
-    fn execute(&self, data: &mut D) -> R;
+    fn execute(self, data: &mut D) -> R;
 }
 
 pub trait Serializer<C> {
@@ -589,94 +589,79 @@ mod tests {
         value: usize,
     }
 
-    #[derive(Serialize, Deserialize, Debug)]
-    enum CounterTx {
-        Increase(IncreaseTx),
-        Double,
-    }
-
-    impl Tx<Counter> for CounterTx {
-        fn execute(&self, data: &mut Counter) {
-            match self {
-                CounterTx::Double => {
-                    data.value *= 2;
-                }
-                CounterTx::Increase(i) => {
-                    i.execute(data);
-                }
-            };
-        }
-    }
-
-    #[derive(Serialize, Deserialize, Debug)]
-    struct IncreaseTx;
-
-    impl Tx<Counter, usize> for IncreaseTx {
-        fn execute(&self, data: &mut Counter) -> usize {
-            data.value += 1;
+    impl Counter {
+        fn increase_by(data: &mut Counter, tx: IncreaseBy) -> usize {
+            data.value += tx.by;
             data.value
         }
     }
 
-    impl Into<CounterTx> for IncreaseTx {
-        fn into(self) -> CounterTx {
-            CounterTx::Increase(self)
-        }
-    }
+    NestedTx!(CounterTx<Counter> {
+        Increase () -> (): |data: &mut Counter, _| {
+            data.value += 1;
+        },
+        IncreaseBy (by: usize) -> usize: Counter::increase_by,
+        DecreaseBy (by: usize, and: usize) -> usize: |data: &mut Counter, tx: DecreaseBy| {
+            data.value -= tx.by - tx.and;
+            data.value
+        },
+    });
 
-    impl From<CounterTx> for IncreaseTx {
-        fn from(value: CounterTx) -> Self {
-            match value {
-                CounterTx::Increase(q) => q,
-                _ => unreachable!(),
-            }
-        }
+    #[tokio::test]
+    async fn test_query() {
+        let dir = tempdir().unwrap();
+        let mut store: JsonStore<Counter, CounterTx> =
+            Store::open(JsonSerializer, StoreOptions::default(), dir.path())
+                .await
+                .unwrap();
+        let result = store.commit(IncreaseBy { by: 5 }).await.unwrap();
+        assert_eq!(5, result);
     }
 
     #[tokio::test]
     async fn test_journal_chunking() {
         let dir = tempdir().unwrap();
         let options = StoreOptions::default().max_journal_entries(NonZeroUsize::new(2).unwrap());
-        let mut store: Store<Counter, CounterTx, _> =
+        let mut store: JsonStore<Counter, CounterTx> =
             Store::open(JsonSerializer, options, dir.path())
                 .await
                 .unwrap();
         let first_ver = store.inner.persistent.read().await.next_snapshot_version;
-        let result = store.commit(IncreaseTx).await.unwrap();
-        println!("result: {result}");
-        // store.commit(CounterTx::Increase).await.unwrap();
-        // assert_eq!(
-        //     store.inner.persistent.read().await.next_snapshot_version,
-        //     first_ver
-        // );
-        // store.commit(CounterTx::Increase).await.unwrap();
-        // assert_eq!(
-        //     store.inner.persistent.read().await.next_snapshot_version,
-        //     first_ver + 1
-        // );
+        store.commit(IncreaseBy { by: 2115 }).await.unwrap();
+        store.commit(Increase).await.unwrap();
+        assert_eq!(
+            store.inner.persistent.read().await.next_snapshot_version,
+            first_ver
+        );
+        store.commit(Increase).await.unwrap();
+        assert_eq!(
+            store.inner.persistent.read().await.next_snapshot_version,
+            first_ver + 1
+        );
     }
 
-    // #[tokio::test]
-    // async fn test_retake_unfulfilled_journal_on_recovery() {
-    //     let dir = tempdir().unwrap();
-    //     let options = StoreOptions::default().max_journal_entries(NonZeroUsize::new(10).unwrap());
-    //     let first_ver = {
-    //         let mut store: Store<Counter, _> =
-    //             Store::open(JsonSerializer, options.clone(), dir.path())
-    //                 .await
-    //                 .unwrap();
-    //         store.commit(CounterCommand::Increase).await.unwrap();
-    //         let ver = store.0.persistent.read().await.next_snapshot_version;
-    //         ver
-    //     };
+    #[tokio::test]
+    async fn test_retake_unfulfilled_journal_on_recovery() {
+        let dir = tempdir().unwrap();
+        let options = StoreOptions::default().max_journal_entries(NonZeroUsize::new(10).unwrap());
+        let first_ver = {
+            let mut store: JsonStore<Counter, CounterTx> =
+                Store::open(JsonSerializer, options.clone(), dir.path())
+                    .await
+                    .unwrap();
+            store.commit(Increase).await.unwrap();
+            let ver = store.inner.persistent.read().await.next_snapshot_version;
+            ver
+        };
 
-    //     let mut store: Store<Counter, _> = Store::open(JsonSerializer, options, dir.path())
-    //         .await
-    //         .unwrap();
-    //     store.commit(CounterCommand::Increase).await.unwrap();
-    //     assert_eq!(
-    //         store.0.persistent.read().await.next_snapshot_version,
-    //         first_ver
-    //     );
-    // }
+        let mut store: JsonStore<Counter, CounterTx> =
+            Store::open(JsonSerializer, options, dir.path())
+                .await
+                .unwrap();
+        store.commit(Increase).await.unwrap();
+        assert_eq!(
+            store.inner.persistent.read().await.next_snapshot_version,
+            first_ver
+        );
+    }
 }
