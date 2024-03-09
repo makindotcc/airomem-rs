@@ -17,7 +17,7 @@ struct Sessions {
 NestedTx!(#[derive(Debug)] SessionsTx<Sessions> {
     // ``-> ()`` is return type unit (aka no value)
     #[derive(Debug, PartialEq)]
-    CreateSession (token: String, user_id: UserId, #[serde(skip)] ignored: usize) -> () = |data: &mut Sessions, tx: CreateSession| {
+    CreateSession (pub token: String, user_id: UserId, #[serde(skip)] ignored: usize) -> () = |data: &mut Sessions, tx: CreateSession| {
         data.operations += 1;
         data.tokens.insert(tx.token, tx.user_id);
     },

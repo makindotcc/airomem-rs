@@ -13,7 +13,7 @@ macro_rules! NestedTx {
             $variant:ident (
                 $(
                     $(#[$field_meta:meta])*
-                    $field_name:ident : $field_type:ty
+                    $field_vis:vis $field_name:ident : $field_type:ty
                 ),* $(,)?
             ) -> $return_type:ty = $tx_fn:expr
         ),* $(,)?
@@ -45,7 +45,7 @@ macro_rules! NestedTx {
                 $visibility struct $variant {
                     $(
                         $(#[$field_meta])*
-                        $field_name: $field_type,
+                        $field_vis $field_name: $field_type,
                     )*
                 }
 
@@ -82,7 +82,7 @@ macro_rules! Subtx {
         $visibility:vis struct $tx_struct:tt {
             $(
                 $(#[$field_meta:meta])*
-                $field_name:ident : $field_type:ty
+                $field_vis:vis $field_name:ident : $field_type:ty
             ),* $(,)?
         }
         $tx_impl:item
@@ -92,7 +92,7 @@ macro_rules! Subtx {
         $visibility struct $tx_struct {
             $(
                 $(#[$field_meta])*
-                $field_name : $field_type
+                $field_vis $field_name : $field_type
             ),*
         }
 
