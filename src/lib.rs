@@ -17,7 +17,9 @@ use tokio::task::JoinHandle;
 use tokio::time::sleep;
 
 pub mod error;
-pub mod nested_tx;
+pub mod tx;
+
+pub use tx::Tx;
 
 pub type JsonStore<D, T> = Store<D, T, JsonSerializer>;
 
@@ -86,8 +88,19 @@ impl<D, T, S> Store<D, T, S> {
         })
     }
 
-    /// Persists [State::Command] to file(s) and executes it on [State].
-    /// Returns [QueryGuard] and holds any store updates until dropped.
+    /// Persists [Tx] to file(s) and calls [Tx::execute] on store data.
+    /// Returns tx result
+    ///
+    /// Takes mutable reference to prevent some kind of deadlocks e.g.
+    /// committing tx, while holding still [QueryGuard] in one, single threaded function:
+    /// ```compile_fail
+    /// async fn request_handler(mut store: JsonStore<Counter, CounterTx>) -> StoreResult<()> {
+    ///     let read_locked = store.query().await; // immutable borrow occurs here
+    ///     store.commit(()).await // mutable borrow occurs here, compilation fails
+    ///                            // (cannot borrow `store` as mutable because it is also borrowed as immutable)
+    /// }
+    /// ```
+    /// However function, like rest of [Store], is thread safe.
     pub async fn commit<Q, R>(&mut self, tx_query: Q) -> StoreResult<R>
     where
         Q: Tx<D, R> + Into<T> + From<T>,
@@ -120,29 +133,11 @@ impl<D, T, S> Store<D, T, S> {
 
     /// Returns immutable, read only store data.
     /// While [QueryGuard] is not dropped, any store updates are locked.
-    ///
-    /// Takes mutable reference to prevent some kind of deadlocks e.g.
-    /// Committing command, while holding still [QueryGuard] in one, single threaded function.
-    /// ```rust,compile_fail
-    /// #[derive(Default, serde::Serialize, serde::Deserialize)]
-    /// struct Counter { count: usize }
-    /// impl airomem::State for Counter {
-    ///     type Command = ();
-    ///     fn execute(&mut self, command: Self::Command) {
-    ///         self.count += 1;
-    ///     }
-    /// }
-    /// async fn request_handler(mut store: airomem::JsonStore<Counter>) -> airomem::StoreResult<()> {
-    ///     let read_locked = store.query().await; // first mutable borrow occurs here
-    ///     store.commit(()).await // second mutable borrow occurs here, compilation fails
-    ///                            // (cannot borrow `store` as mutable more than once at a time)
-    /// }
-    /// ```
-    pub async fn query(&mut self) -> QueryGuard<'_, D> {
+    pub async fn query(&self) -> QueryGuard<'_, D> {
         QueryGuard(self.inner.persistent.read().await)
     }
 
-    /// Flushes buffered commands to file and synces it using [File::sync_data].
+    /// Flushes buffered transactions to file and synces it using [File::sync_data].
     pub async fn flush_and_sync(&self) -> StoreResult<()> {
         self.inner
             .persistent
@@ -186,14 +181,14 @@ pub struct StoreOptions {
 }
 
 impl StoreOptions {
-    /// Maximal amount of persisted commands in journal file before a
+    /// Maximal amount of persisted transactions in journal file before a
     /// snapshot is created and a new journal file.
     pub fn max_journal_entries(mut self, value: NonZeroUsize) -> Self {
         self.max_journal_entries = value;
         self
     }
 
-    /// Dictates [Store] how often commands should be saved to [JournalFile].
+    /// Dictates [Store] how often transactions should be saved to [JournalFile].
     pub fn journal_flush_policy(mut self, value: JournalFlushPolicy) -> Self {
         self.journal_flush_policy = value;
         self
@@ -217,13 +212,13 @@ impl Default for StoreOptions {
     }
 }
 
-/// Dictates [Store] how often commands should be saved to [JournalFile].
+/// Dictates [Store] how often transactions should be saved to [JournalFile].
 #[derive(Debug, Clone, Copy)]
 pub enum JournalFlushPolicy {
-    /// Slowest, but safest. Immediately saves command to file on [Store::commit].
+    /// Slowest, but safest. Immediately saves transactions to file on [Store::commit].
     EveryCommit,
-    /// [Store] will own background task that will attempt to flush commands every defined [Duration].
-    /// Commands commited between flushes might be lost in case of crash.
+    /// [Store] will own background task that will attempt to flush transactions every defined [Duration].
+    /// Transactions commited between flushes might be lost in case of crash.
     /// Any flush errors are printed to stderr using [eprintln!].
     Every(Duration),
     /// You are responsible for flushing data to file using [Store::flush_and_sync].
@@ -397,7 +392,7 @@ impl JournalFile {
         })
     }
 
-    async fn append(&mut self, command: &[u8]) -> std::io::Result<()> {
+    async fn append(&mut self, transaction: &[u8]) -> std::io::Result<()> {
         let writer = match &mut self.writer {
             Some(writer) => writer,
             None => {
@@ -407,7 +402,7 @@ impl JournalFile {
                 ))
             }
         };
-        if let Err(err) = writer.write_all(command).await {
+        if let Err(err) = writer.write_all(transaction).await {
             self.writer = None;
             return Err(err);
         }
@@ -528,16 +523,12 @@ impl PersistenceAction {
     }
 }
 
-pub trait Tx<D, R = ()> {
-    fn execute(self, data: &mut D) -> R;
-}
-
-pub trait Serializer<C> {
+pub trait Serializer<T> {
     type Error: std::error::Error + Send + Sync + 'static;
 
-    fn serialize(&self, command: &C) -> Result<Vec<u8>, Self::Error>;
+    fn serialize(&self, transaction: &T) -> Result<Vec<u8>, Self::Error>;
 
-    fn deserialize<R>(&self, reader: R) -> Result<Option<C>, Self::Error>
+    fn deserialize<R>(&self, reader: R) -> Result<Option<T>, Self::Error>
     where
         R: std::io::Read;
 }
@@ -570,7 +561,7 @@ where
                 // ignore partially saved entry, but
                 // is eof always equal to interrupted write?
                 // todo:
-                // return error for half-written command and give option to api to handle it
+                // return error for half-written transaction and give option to api to handle it
                 Ok(None)
             }
             Err(err) => Err(err),
@@ -606,17 +597,6 @@ mod tests {
             data.value
         },
     });
-
-    #[tokio::test]
-    async fn test_query() {
-        let dir = tempdir().unwrap();
-        let mut store: JsonStore<Counter, CounterTx> =
-            Store::open(JsonSerializer, StoreOptions::default(), dir.path())
-                .await
-                .unwrap();
-        let result = store.commit(IncreaseBy { by: 5 }).await.unwrap();
-        assert_eq!(5, result);
-    }
 
     #[tokio::test]
     async fn test_journal_chunking() {

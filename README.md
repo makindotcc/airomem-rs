@@ -8,7 +8,7 @@
 ## Assumptions
 
 - All data lives in memory guarded with `tokio::sync::RwLock`, reads are fast and concurrent safe.
-- By default every command is saved to append-only journal file and immediately [fsynced](https://man7.org/linux/man-pages/man2/fsync.2.html).
+- By default every transaction is saved to append-only journal file and immediately [fsynced](https://man7.org/linux/man-pages/man2/fsync.2.html).
   By that, individual writes are slow, but they SHOULD survive crashes (e.g. power outage, software panic). \
   However, you can set periodic sync or manual. See `JournalFlushPolicy` for more info.
   Recommended for data that may be lost (e.g. cache, http session storage).
@@ -16,9 +16,10 @@
 
 ## Features
 
-- [x] - saving executed commands to append only file
+- [x] - saving executed transactions to append only file
 - [x] - split journal log file if too big - while restoring data, all journal logs are loaded at once from disk to maximise throughput (and for simplicity reasons)
 - [x] - snapshots for faster recovery
+- [ ] - stable api
 
 ## Resources
 

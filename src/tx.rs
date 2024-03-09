@@ -1,3 +1,8 @@
+pub trait Tx<D, R = ()> {
+    fn execute(self, data: &mut D) -> R;
+}
+
+/// Check tests or readme for example usage.
 #[macro_export]
 macro_rules! NestedTx {
     ($name:tt<$data:tt> {
@@ -54,7 +59,7 @@ macro_rules! Subtx {
         #[derive(Serialize, Deserialize)]
         pub struct $tx_struct;
 
-        $crate::ImplFromInto!($wrapper, $tx_struct);
+        $crate::EnumBorrowOwned!($wrapper, $tx_struct);
 
         $tx_impl
     };
@@ -70,16 +75,23 @@ macro_rules! Subtx {
             $($field_name : $field_type),*
         }
 
-        $crate::ImplFromInto!($wrapper, $tx_struct);
+        $crate::EnumBorrowOwned!($wrapper, $tx_struct);
 
         $tx_impl
     };
 }
 
+/// Implements [Into<TargetEnum>] and [From<TargetEnum>] for given struct.
+/// [crate::Tx] needs to implement this, because we need to wrap nested tx temporarily into
+/// its parent to serialize it, but then we need it back to execute it on data.
+/// 
+/// We can't just simply change order (serialization -> execution to execution -> serialization),
+/// because serialization can throw I/O error and we don't want to get different data state than
+/// its representation in file.
 #[macro_export]
-macro_rules! ImplFromInto {
+macro_rules! EnumBorrowOwned {
     ($wrapper:tt, $sub:tt) => {
-        $crate::ImplFromInto!($wrapper::$sub, $sub);
+        $crate::EnumBorrowOwned!($wrapper::$sub, $sub);
     };
     ($wrapper:tt :: $wrapper_variant:tt, $sub:tt) => {
         impl Into<$wrapper> for $sub {
