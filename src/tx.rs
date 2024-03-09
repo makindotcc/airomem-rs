@@ -2,103 +2,34 @@ pub trait Tx<D, R = ()> {
     fn execute(self, data: &mut D) -> R;
 }
 
-/// Check tests or readme for example usage.
 #[macro_export]
-macro_rules! NestedTx {
+macro_rules! MergeTx {
     (
-        $(#[$root_meta:meta])*
-        $visibility:vis $name:ident<$data:tt> {
-        $(
-            $(#[$variant_meta:meta])*
-            $variant:ident (
-                $(
-                    $(#[$field_meta:meta])*
-                    $field_vis:vis $field_name:ident : $field_type:ty
-                ),* $(,)?
-            ) -> $return_type:ty = $tx_fn:expr
-        ),* $(,)?
-    }) => {
+        $(#[$merged_meta:meta])*
+        $visibility:vis $tx_name:ident<$data:ident> = $($subtx:ident)|*
+    ) => {
         #[derive(serde::Serialize, serde::Deserialize)]
-        $(#[$root_meta])*
-        $visibility enum $name {
+        $(#[$merged_meta])*
+        $visibility enum $tx_name {
             $(
-                $variant($variant),
+                $subtx($subtx),
             )*
         }
 
-        impl $crate::Tx<$data> for $name {
+        impl $crate::Tx<$data> for $tx_name {
             fn execute(self, data: &mut $data) {
                 match self {
                     $(
-                        $name::$variant(it) => {
-                            let _ = it.execute(data);
+                        $tx_name::$subtx(child) => {
+                            let _ = child.execute(data);
                         }
                     )*
                 }
             }
         }
-
         $(
-            $crate::Subtx! {
-                #[tx($name)]
-                $(#[$variant_meta])*
-                $visibility struct $variant {
-                    $(
-                        $(#[$field_meta])*
-                        $field_vis $field_name: $field_type,
-                    )*
-                }
-
-                impl $crate::Tx<$data, $return_type> for $variant {
-                    fn execute(self, data: &mut $data) -> $return_type {
-                        $tx_fn(data, self)
-                    }
-                }
-            }
+            $crate::EnumBorrowOwned!($tx_name, $subtx);
         )*
-    };
-}
-
-#[macro_export]
-macro_rules! Subtx {
-    (
-        #[tx($wrapper:tt)]
-        $(#[$variant_meta:meta])*
-        $visibility:vis struct $tx_struct:tt {
-        }
-        $tx_impl:item
-    ) => {
-        #[derive(serde::Serialize, serde::Deserialize)]
-        $(#[$variant_meta])*
-        $visibility struct $tx_struct;
-
-        $crate::EnumBorrowOwned!($wrapper, $tx_struct);
-
-        $tx_impl
-    };
-    (
-        #[tx($wrapper:tt)]
-        $(#[$variant_meta:meta])*
-        $visibility:vis struct $tx_struct:tt {
-            $(
-                $(#[$field_meta:meta])*
-                $field_vis:vis $field_name:ident : $field_type:ty
-            ),* $(,)?
-        }
-        $tx_impl:item
-    ) => {
-        #[derive(serde::Serialize, serde::Deserialize)]
-        $(#[$variant_meta])*
-        $visibility struct $tx_struct {
-            $(
-                $(#[$field_meta])*
-                $field_vis $field_name : $field_type
-            ),*
-        }
-
-        $crate::EnumBorrowOwned!($wrapper, $tx_struct);
-
-        $tx_impl
     };
 }
 

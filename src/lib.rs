@@ -580,23 +580,38 @@ mod tests {
         value: usize,
     }
 
-    impl Counter {
-        fn increase_by(data: &mut Counter, tx: IncreaseBy) -> usize {
-            data.value += tx.by;
-            data.value
+    MergeTx!(CounterTx<Counter> = Increase | IncreaseBy | DecreaseBy);
+
+    #[derive(Serialize, Deserialize)]
+    struct Increase;
+
+    #[derive(Serialize, Deserialize)]
+    struct IncreaseBy {
+        by: usize,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    struct DecreaseBy {
+        by: usize,
+    }
+
+    impl Tx<Counter> for Increase {
+        fn execute(self, data: &mut Counter) {
+            data.value += 1;
         }
     }
 
-    NestedTx!(CounterTx<Counter> {
-        Increase () -> () = |data: &mut Counter, _| {
-            data.value += 1;
-        },
-        IncreaseBy (by: usize) -> usize = Counter::increase_by,
-        DecreaseBy (by: usize, and: usize) -> usize = |data: &mut Counter, tx: DecreaseBy| {
-            data.value -= tx.by - tx.and;
-            data.value
-        },
-    });
+    impl Tx<Counter> for IncreaseBy {
+        fn execute(self, data: &mut Counter) {
+            data.value += data.value;
+        }
+    }
+
+    impl Tx<Counter> for DecreaseBy {
+        fn execute(self, data: &mut Counter) {
+            data.value -= data.value;
+        }
+    }
 
     #[tokio::test]
     async fn test_journal_chunking() {

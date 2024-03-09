@@ -29,34 +29,42 @@
 ## Example
 
 ```rust
+
 type UserId = usize;
 type SessionsStore = JsonStore<Sessions, SessionsTx>;
 
 #[derive(Serialize, Deserialize, Default)]
-struct Sessions {
+pub struct Sessions {
     tokens: HashMap<String, UserId>,
     operations: usize,
 }
 
-// ``pub`` - visibility, optional
-// ``SessionsTx`` - your desired name for root Tx name. It implements enum ``SessionsTx`` under the hood.
-// ``Sessions`` - data struct name, used in closure
-NestedTx!(pub #[derive(Debug)] SessionsTx<Sessions> {
-    // ``-> ()`` is return type unit (aka no value)
-    #[derive(Debug, PartialEq)]
-    pub CreateSession (token: String, user_id: UserId, ignored: usize) -> () = |data: &mut Sessions, tx: CreateSession| {
+MergeTx!(pub SessionsTx<Sessions> = CreateSession | DeleteSession);
+
+#[derive(Serialize, Deserialize)]
+pub struct CreateSession {
+    token: String,
+    user_id: UserId,
+}
+
+impl Tx<Sessions> for CreateSession {
+    fn execute(self, data: &mut Sessions) {
         data.operations += 1;
-        data.tokens.insert(tx.token, tx.user_id);
-    },
-    // ``DeleteSession`` - your desired name for sub-tx struct implementation.
-    // ``token: String, user_id: UserId`` - variables for ``DeleteSession`` struct
-    // ``Option<UserId>`` - return type from closure, used to return data from store.commit(DeleteSession { ... })...
-    #[derive(Debug)]
-    DeleteSession (token: String) -> Option<UserId> = |data: &mut Sessions, tx: DeleteSession| {
+        data.tokens.insert(self.token, self.user_id);
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct DeleteSession {
+    token: String,
+}
+
+impl Tx<Sessions, Option<UserId>> for DeleteSession {
+    fn execute(self, data: &mut Sessions) -> Option<UserId> {
         data.operations += 1;
-        data.tokens.remove(&tx.token)
-    },
-});
+        data.tokens.remove(&self.token)
+    }
+}
 
 #[tokio::test]
 async fn test_mem_commit() {
@@ -71,7 +79,6 @@ async fn test_mem_commit() {
         .commit(CreateSession {
             token: example_token.clone(),
             user_id: example_uid,
-            ignored: 0,
         })
         .await
         .unwrap();
@@ -87,69 +94,5 @@ async fn test_mem_commit() {
         .await
         .unwrap();
     assert_eq!(deleted_uid, Some(example_uid));
-}
-
-// No macro ``NestedTx!`` equivalent:
-mod no_nested_tx_macro {
-    #[derive(serde::Serialize, serde::Deserialize)]
-    #[derive(Debug)]
-    pub enum SessionsTx {
-        CreateSession(CreateSession),
-        DeleteSession(DeleteSession),
-    }
-
-    #[derive(serde::Serialize, serde::Deserialize)]
-    #[derive(Debug, PartialEq)]
-    pub struct CreateSession {
-        token: String,
-        user_id: UserId,
-        ignored: 0,
-    }
-
-    impl Into<SessionsTx> for CreateSession {
-        fn into(self) -> SessionsTx {
-            SessionsTx::CreateSession(self)
-        }
-    }
-
-    impl From<SessionsTx> for CreateSession {
-        fn from(value: SessionsTx) -> Self {
-            match value {
-                SessionsTx::CreateSession(inner) => inner,
-                _ => unreachable!(),
-            }
-        }
-    }
-
-    #[derive(serde::Serialize, serde::Deserialize)]
-    #[derive(Debug)]
-    struct DeleteSession {
-        token: String,
-    }
-
-    // macro implementing `Into` and `From` like we have done it above manually for CreateSession
-    airomem::EnumBorrowOwned!(SessionsTx, DeleteSession);
-
-    impl Tx<Sessions, ()> for SessionsTx {
-        fn execute(self, data: &mut Sessions) -> () {
-            match self {
-                SessionsTx::CreateSession(it) => {
-                    it.execute(data);
-                }
-                SessionsTx::DeleteSession(it) => {
-                    it.execute(data);
-                }
-            }
-        }
-    }
-
-    impl Tx<Sessions, usize> for DeleteSession {
-        fn execute(self, data: &mut Sessions) -> usize {
-            data.operations += 1;
-            data.tokens.remove(&self.token)
-        }
-    }
-
-    // impl Tx for CreateSession (...)
 }
 ```

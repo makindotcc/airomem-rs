@@ -1,4 +1,4 @@
-use airomem::{JournalFlushPolicy, JsonSerializer, JsonStore, NestedTx, Store, StoreOptions};
+use airomem::{JournalFlushPolicy, JsonSerializer, JsonStore, MergeTx, Store, StoreOptions, Tx};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, num::NonZeroUsize};
 use tempfile::tempdir;
@@ -7,29 +7,37 @@ type UserId = usize;
 type SessionsStore = JsonStore<Sessions, SessionsTx>;
 
 #[derive(Serialize, Deserialize, Default)]
-struct Sessions {
+pub struct Sessions {
     tokens: HashMap<String, UserId>,
     operations: usize,
 }
 
-// ``SessionsTx`` - your desired name for root Tx name. It implements enum ``SessionsTx`` under the hood.
-// ``Sessions`` - data struct name, used in closure
-NestedTx!(#[derive(Debug)] SessionsTx<Sessions> {
-    // ``-> ()`` is return type unit (aka no value)
-    #[derive(Debug, PartialEq)]
-    CreateSession (pub token: String, user_id: UserId, #[serde(skip)] ignored: usize) -> () = |data: &mut Sessions, tx: CreateSession| {
+MergeTx!(pub SessionsTx<Sessions> = CreateSession | DeleteSession);
+
+#[derive(Serialize, Deserialize)]
+pub struct CreateSession {
+    token: String,
+    user_id: UserId,
+}
+
+impl Tx<Sessions> for CreateSession {
+    fn execute(self, data: &mut Sessions) {
         data.operations += 1;
-        data.tokens.insert(tx.token, tx.user_id);
-    },
-    // ``DeleteSession`` - your desired name for sub-tx struct implementation.
-    // ``token: String, user_id: UserId`` - variables for ``DeleteSession`` struct
-    // ``Option<UserId>`` - return type from closure, used to return data from store.commit(DeleteSession { ... })...
-    #[derive(Debug)]
-    DeleteSession (token: String) -> Option<UserId> = |data: &mut Sessions, tx: DeleteSession| {
+        data.tokens.insert(self.token, self.user_id);
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct DeleteSession {
+    token: String,
+}
+
+impl Tx<Sessions, Option<UserId>> for DeleteSession {
+    fn execute(self, data: &mut Sessions) -> Option<UserId> {
         data.operations += 1;
-        data.tokens.remove(&tx.token)
-    },
-});
+        data.tokens.remove(&self.token)
+    }
+}
 
 #[tokio::test]
 async fn test_mem_commit() {
@@ -44,7 +52,6 @@ async fn test_mem_commit() {
         .commit(CreateSession {
             token: example_token.clone(),
             user_id: example_uid,
-            ignored: 0,
         })
         .await
         .unwrap();
@@ -73,7 +80,6 @@ async fn test_manual_flush() {
                 .commit(CreateSession {
                     token: "access_token".to_string(),
                     user_id: 1,
-                    ignored: 0,
                 })
                 .await
                 .unwrap();
@@ -127,7 +133,6 @@ async fn test_journal_rebuild() {
             .commit(CreateSession {
                 token: format!("token{i}"),
                 user_id: i,
-                ignored: 0,
             })
             .await
             .unwrap();
@@ -158,7 +163,6 @@ async fn test_rebuild_with_snapshot() {
                     .commit(CreateSession {
                         token: format!("token{i}"),
                         user_id: i,
-                        ignored: 0,
                     })
                     .await
                     .unwrap();
