@@ -32,17 +32,23 @@
 type UserId = usize;
 type SessionsStore = JsonStore<Sessions, SessionsTx>;
 
-#[derive(Serialize, Deserialize, Default, Debug)]
+#[derive(Serialize, Deserialize, Default)]
 struct Sessions {
     tokens: HashMap<String, UserId>,
     operations: usize,
 }
 
+// ``SessionsTx`` - your desired name for root Tx name. It implements enum ``SessionsTx`` under the hood.
+// ``Sessions`` - data struct name, used in closure
 NestedTx!(SessionsTx<Sessions> {
+    // ``-> ()`` is return type unit (aka no value)
     CreateSession (token: String, user_id: UserId) -> (): |data: &mut Sessions, tx: CreateSession| {
         data.operations += 1;
         data.tokens.insert(tx.token, tx.user_id);
     },
+    // ``DeleteSession`` - your desired name for sub-tx struct implementation.
+    // ``token: String, user_id: UserId`` - variables for ``DeleteSession`` struct
+    // ``Option<UserId>`` - return type from closure, used to return data from store.commit(DeleteSession { ... })...
     DeleteSession (token: String) -> Option<UserId>: |data: &mut Sessions, tx: DeleteSession| {
         data.operations += 1;
         data.tokens.remove(&tx.token)
@@ -77,5 +83,65 @@ async fn test_mem_commit() {
         .await
         .unwrap();
     assert_eq!(deleted_uid, Some(example_uid));
+}
+
+// No macro ``NestedTx!`` equivalent:
+mod no_nested_tx_macro {
+    #[derive(serde::Serialize, serde::Deserialize)]
+    pub enum SessionsTx {
+        CreateSession(CreateSession),
+        DeleteSession(DeleteSession),
+    }
+
+    #[derive(serde::Serialize, serde::Deserialize)]
+    pub struct CreateSession {
+        token: String,
+        user_id: UserId,
+    }
+
+    impl Into<SessionsTx> for CreateSession {
+        fn into(self) -> SessionsTx {
+            SessionsTx::CreateSession(self)
+        }
+    }
+
+    impl From<SessionsTx> for CreateSession {
+        fn from(value: SessionsTx) -> Self {
+            match value {
+                SessionsTx::CreateSession(inner) => inner,
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    #[derive(serde::Serialize, serde::Deserialize)]
+    pub struct DeleteSession {
+        token: String,
+    }
+
+    // macro implementing `Into` and `From` like we have done it above manually for CreateSession
+    airomem::EnumBorrowOwned!(SessionsTx, DeleteSession);
+
+    impl Tx<Sessions, ()> for SessionsTx {
+        fn execute(self, data: &mut Sessions) -> () {
+            match self {
+                SessionsTx::CreateSession(it) => {
+                    it.execute(data);
+                }
+                SessionsTx::DeleteSession(it) => {
+                    it.execute(data);
+                }
+            }
+        }
+    }
+
+    impl Tx<Sessions, usize> for DeleteSession {
+        fn execute(self, data: &mut Sessions) -> usize {
+            data.operations += 1;
+            data.tokens.remove(&self.token)
+        }
+    }
+
+    // impl Tx for CreateSession (...)
 }
 ```
