@@ -5,17 +5,21 @@ pub trait Tx<D, R = ()> {
 /// Check tests or readme for example usage.
 #[macro_export]
 macro_rules! NestedTx {
-    ($visibility:vis $name:ident<$data:tt> {
+    (
+        $(#[$root_meta:meta])*
+        $visibility:vis $name:ident<$data:tt> {
         $(
-            $variant:tt (
+            $(#[$variant_meta:meta])*
+            $variant:ident (
                 $(
-                    $(#[$m:meta])*
+                    $(#[$field_meta:meta])*
                     $field_name:ident : $field_type:ty
                 ),* $(,)?
             ) -> $return_type:ty = $tx_fn:expr
         ),* $(,)?
     }) => {
         #[derive(serde::Serialize, serde::Deserialize)]
+        $(#[$root_meta])*
         $visibility enum $name {
             $(
                 $variant($variant),
@@ -37,8 +41,10 @@ macro_rules! NestedTx {
         $(
             $crate::Subtx! {
                 #[tx($name)]
+                $(#[$variant_meta])*
                 $visibility struct $variant {
                     $(
+                        $(#[$field_meta])*
                         $field_name: $field_type,
                     )*
                 }
@@ -57,11 +63,13 @@ macro_rules! NestedTx {
 macro_rules! Subtx {
     (
         #[tx($wrapper:tt)]
+        $(#[$variant_meta:meta])*
         $visibility:vis struct $tx_struct:tt {
         }
         $tx_impl:item
     ) => {
         #[derive(serde::Serialize, serde::Deserialize)]
+        $(#[$variant_meta])*
         $visibility struct $tx_struct;
 
         $crate::EnumBorrowOwned!($wrapper, $tx_struct);
@@ -70,14 +78,22 @@ macro_rules! Subtx {
     };
     (
         #[tx($wrapper:tt)]
+        $(#[$variant_meta:meta])*
         $visibility:vis struct $tx_struct:tt {
-            $($field_name:ident : $field_type:ty),* $(,)?
+            $(
+                $(#[$field_meta:meta])*
+                $field_name:ident : $field_type:ty
+            ),* $(,)?
         }
         $tx_impl:item
     ) => {
         #[derive(serde::Serialize, serde::Deserialize)]
+        $(#[$variant_meta])*
         $visibility struct $tx_struct {
-            $($field_name : $field_type),*
+            $(
+                $(#[$field_meta])*
+                $field_name : $field_type
+            ),*
         }
 
         $crate::EnumBorrowOwned!($wrapper, $tx_struct);

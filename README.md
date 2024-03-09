@@ -41,17 +41,18 @@ struct Sessions {
 // ``pub`` - visibility, optional
 // ``SessionsTx`` - your desired name for root Tx name. It implements enum ``SessionsTx`` under the hood.
 // ``Sessions`` - data struct name, used in closure
-NestedTx!(pub SessionsTx<Sessions> {
+NestedTx!(pub #[derive(Debug)] SessionsTx<Sessions> {
     // ``-> ()`` is return type unit (aka no value)
-    CreateSession (token: String, user_id: UserId, #[serde(skip)] ignored: usize) -> (): |data: &mut Sessions, tx: CreateSession| {
+    #[derive(Debug, PartialEq)]
+    pub CreateSession (token: String, user_id: UserId, ignored: usize) -> () = |data: &mut Sessions, tx: CreateSession| {
         data.operations += 1;
         data.tokens.insert(tx.token, tx.user_id);
     },
-    // ``pub`` - visibility, optional
     // ``DeleteSession`` - your desired name for sub-tx struct implementation.
     // ``token: String, user_id: UserId`` - variables for ``DeleteSession`` struct
     // ``Option<UserId>`` - return type from closure, used to return data from store.commit(DeleteSession { ... })...
-    pub DeleteSession (token: String) -> Option<UserId>: |data: &mut Sessions, tx: DeleteSession| {
+    #[derive(Debug)]
+    DeleteSession (token: String) -> Option<UserId> = |data: &mut Sessions, tx: DeleteSession| {
         data.operations += 1;
         data.tokens.remove(&tx.token)
     },
@@ -91,13 +92,15 @@ async fn test_mem_commit() {
 // No macro ``NestedTx!`` equivalent:
 mod no_nested_tx_macro {
     #[derive(serde::Serialize, serde::Deserialize)]
+    #[derive(Debug)]
     pub enum SessionsTx {
         CreateSession(CreateSession),
         DeleteSession(DeleteSession),
     }
 
     #[derive(serde::Serialize, serde::Deserialize)]
-    struct CreateSession {
+    #[derive(Debug, PartialEq)]
+    pub struct CreateSession {
         token: String,
         user_id: UserId,
         ignored: 0,
@@ -119,7 +122,8 @@ mod no_nested_tx_macro {
     }
 
     #[derive(serde::Serialize, serde::Deserialize)]
-    pub struct DeleteSession {
+    #[derive(Debug)]
+    struct DeleteSession {
         token: String,
     }
 
