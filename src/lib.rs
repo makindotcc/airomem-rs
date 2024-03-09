@@ -138,7 +138,7 @@ impl<D, T, S> Store<D, T, S> {
     }
 
     /// Flushes buffered transactions to file and synces it using [File::sync_data].
-    pub async fn flush_and_sync(&self) -> StoreResult<()> {
+    pub async fn flush_and_sync(&mut self) -> StoreResult<()> {
         self.inner
             .persistent
             .write()
