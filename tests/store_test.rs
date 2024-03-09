@@ -16,7 +16,7 @@ struct Sessions {
 // ``Sessions`` - data struct name, used in closure
 NestedTx!(SessionsTx<Sessions> {
     // ``-> ()`` is return type unit (aka no value)
-    CreateSession (token: String, user_id: UserId) -> (): |data: &mut Sessions, tx: CreateSession| {
+    CreateSession (token: String, user_id: UserId, #[serde(skip)] ignored: usize) -> (): |data: &mut Sessions, tx: CreateSession| {
         data.operations += 1;
         data.tokens.insert(tx.token, tx.user_id);
     },
@@ -42,6 +42,7 @@ async fn test_mem_commit() {
         .commit(CreateSession {
             token: example_token.clone(),
             user_id: example_uid,
+            ignored: 0,
         })
         .await
         .unwrap();
@@ -70,6 +71,7 @@ async fn test_manual_flush() {
                 .commit(CreateSession {
                     token: "access_token".to_string(),
                     user_id: 1,
+                    ignored: 0,
                 })
                 .await
                 .unwrap();
@@ -123,6 +125,7 @@ async fn test_journal_rebuild() {
             .commit(CreateSession {
                 token: format!("token{i}"),
                 user_id: i,
+                ignored: 0,
             })
             .await
             .unwrap();
@@ -153,6 +156,7 @@ async fn test_rebuild_with_snapshot() {
                     .commit(CreateSession {
                         token: format!("token{i}"),
                         user_id: i,
+                        ignored: 0,
                     })
                     .await
                     .unwrap();

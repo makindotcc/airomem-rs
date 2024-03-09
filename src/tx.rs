@@ -7,7 +7,12 @@ pub trait Tx<D, R = ()> {
 macro_rules! NestedTx {
     ($name:tt<$data:tt> {
         $(
-            $variant:tt ($($field_name:tt : $field_type:ty),* $(,)?) -> $return_type:ty: $tx_fn:expr
+            $variant:tt (
+                $(
+                    $(#[$m:meta])* 
+                    $field_name:ident : $field_type:ty
+                ),* $(,)?
+            ) -> $return_type:ty: $tx_fn:expr
         ),* $(,)?
     }) => {
         #[derive(serde::Serialize, serde::Deserialize)]
@@ -66,7 +71,7 @@ macro_rules! Subtx {
     (
         #[tx($wrapper:tt)]
         struct $tx_struct:tt {
-            $($field_name:tt : $field_type:ty),* $(,)?
+            $($field_name:ident : $field_type:ty),* $(,)?
         }
         $tx_impl:item
     ) => {
