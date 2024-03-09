@@ -5,7 +5,7 @@ pub trait Tx<D, R = ()> {
 /// Check tests or readme for example usage.
 #[macro_export]
 macro_rules! NestedTx {
-    ($name:tt<$data:tt> {
+    ($visibility:vis $name:ident<$data:tt> {
         $(
             $variant:tt (
                 $(
@@ -16,7 +16,7 @@ macro_rules! NestedTx {
         ),* $(,)?
     }) => {
         #[derive(serde::Serialize, serde::Deserialize)]
-        pub enum $name {
+        $visibility enum $name {
             $(
                 $variant($variant),
             )*
@@ -37,7 +37,7 @@ macro_rules! NestedTx {
         $(
             $crate::Subtx! {
                 #[tx($name)]
-                struct $variant {
+                $visibility struct $variant {
                     $(
                         $field_name: $field_type,
                     )*
@@ -57,12 +57,12 @@ macro_rules! NestedTx {
 macro_rules! Subtx {
     (
         #[tx($wrapper:tt)]
-        struct $tx_struct:tt {
+        $visibility:vis struct $tx_struct:tt {
         }
         $tx_impl:item
     ) => {
         #[derive(serde::Serialize, serde::Deserialize)]
-        pub struct $tx_struct;
+        $visibility struct $tx_struct;
 
         $crate::EnumBorrowOwned!($wrapper, $tx_struct);
 
@@ -70,13 +70,13 @@ macro_rules! Subtx {
     };
     (
         #[tx($wrapper:tt)]
-        struct $tx_struct:tt {
+        $visibility:vis struct $tx_struct:tt {
             $($field_name:ident : $field_type:ty),* $(,)?
         }
         $tx_impl:item
     ) => {
         #[derive(serde::Serialize, serde::Deserialize)]
-        pub struct $tx_struct {
+        $visibility struct $tx_struct {
             $($field_name : $field_type),*
         }
 
