@@ -9,7 +9,7 @@ macro_rules! NestedTx {
         $(
             $variant:tt (
                 $(
-                    $(#[$m:meta])* 
+                    $(#[$m:meta])*
                     $field_name:ident : $field_type:ty
                 ),* $(,)?
             ) -> $return_type:ty = $tx_fn:expr
