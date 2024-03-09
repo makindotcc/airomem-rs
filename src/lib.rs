@@ -23,6 +23,15 @@ pub use tx::Tx;
 
 pub type JsonStore<D, T> = Store<D, T, JsonSerializer>;
 
+/// [Store] is clonable (so do not wrap it in [Arc]!), thread-safe implementation of system prevalence.
+/// 
+/// Some methods like [Store::commit] take mutable reference to prevent easiest
+/// deadlocks in one function like:
+/// ```compile_fail
+/// let read_locked = store.query().await; // immutable borrow occurs here
+/// store.commit(...).await // mutable borrow occurs here, compilation fails
+/// ```
+/// So do not wrap it using [Arc] and [Mutex]/[RwLock]. Just [Clone] it.
 pub struct Store<D, T, S> {
     inner: Arc<StoreInner<D, S>>,
     _phantom: PhantomData<T>,
@@ -38,6 +47,8 @@ impl<D, T, S> Clone for Store<D, T, S> {
 }
 
 impl<D, T, S> Store<D, T, S> {
+    /// Restores [Store] state using files from given directory.
+    /// If none, new store is created with [`<D>`] data [Default::default].
     pub async fn open(
         serializer: S,
         options: StoreOptions,
