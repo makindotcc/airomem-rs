@@ -31,7 +31,7 @@ macro_rules! NestedTx {
                 match self {
                     $(
                         $name::$variant(it) => {
-                            it.execute(data);
+                            let _ = it.execute(data);
                         }
                     )*
                 }
