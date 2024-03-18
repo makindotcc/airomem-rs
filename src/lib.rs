@@ -111,22 +111,6 @@ impl<D, T, S> Store<D, T, S> {
             .await
             .map_err(StoreError::JournalIO)
     }
-
-    // fn start_flusher(interval: Duration, persistent: SharedPersistentData<D>) -> FlusherGuard
-    // where
-    //     D: Sync + Send + 'static,
-    //     S: Serializer<T>,
-    // {
-    //     FlusherGuard(tokio::spawn(async move {
-    //         loop {
-    //             sleep(interval).await;
-    //             let mut persistent = persistent.write().await;
-    //             if let Err(err) = persistent.journal.flush_and_sync().await {
-    //                 eprintln!("Could not flush journal log: {err:?}");
-    //             }
-    //         }
-    //     }))
-    // }
 }
 
 #[derive(Debug, Clone)]
