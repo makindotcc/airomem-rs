@@ -1,20 +1,12 @@
 use error::{StoreError, StoreResult};
-use std::convert::Infallible;
 use std::ffi::OsStr;
 use std::marker::PhantomData;
 use std::num::NonZeroUsize;
-use std::ops::Deref;
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::Duration;
 use tokio::fs::{self, File};
 use tokio::io::BufWriter;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::RwLock;
-use tokio::sync::RwLockReadGuard;
-use tokio::task::JoinHandle;
-use tokio::time::sleep;
 
 pub mod error;
 pub mod tx;
@@ -23,27 +15,12 @@ pub use tx::Tx;
 
 pub type JsonStore<D, T> = Store<D, T, JsonSerializer>;
 
-/// [Store] is clonable (so do not wrap it in [Arc]!), thread-safe implementation of system prevalence.
-/// 
-/// Some methods like [Store::commit] take mutable reference to prevent easiest
-/// deadlocks in one function like:
-/// ```compile_fail
-/// let read_locked = store.query().await; // immutable borrow occurs here
-/// store.commit(...).await // mutable borrow occurs here, compilation fails
-/// ```
-/// So do not wrap it using [Arc] and [Mutex]/[RwLock]. Just [Clone] it.
+/// [Store] is implementation of system prevalence.
 pub struct Store<D, T, S> {
-    inner: Arc<StoreInner<D, S>>,
+    persistent: PersistentData<D>,
+    serializer: S,
+    options: StoreOptions,
     _phantom: PhantomData<T>,
-}
-
-impl<D, T, S> Clone for Store<D, T, S> {
-    fn clone(&self) -> Self {
-        Self {
-            inner: Arc::clone(&self.inner),
-            _phantom: PhantomData,
-        }
-    }
 }
 
 impl<D, T, S> Store<D, T, S> {
@@ -69,7 +46,7 @@ impl<D, T, S> Store<D, T, S> {
                 PersistenceAction::Journal { version, .. } => *version,
             })
             .unwrap_or_default();
-        let persistent = Arc::new(RwLock::new({
+        let persistent = {
             let flush_on_drop = options.flush_synchronously_on_drop
                 && !matches!(
                     options.journal_flush_policy,
@@ -81,107 +58,59 @@ impl<D, T, S> Store<D, T, S> {
                 .rebuild::<T, S>(&serializer, persistence_actions)
                 .await?;
             persistent
-        }));
-        let _flusher_guard = match options.journal_flush_policy {
-            JournalFlushPolicy::EveryCommit | JournalFlushPolicy::Manually => None,
-            JournalFlushPolicy::Every(interval) => {
-                Some(Self::start_flusher(interval, Arc::clone(&persistent)))
-            }
         };
         Ok(Self {
-            inner: Arc::new(StoreInner {
-                persistent,
-                serializer,
-                options,
-                _flusher_guard,
-            }),
+            persistent,
+            serializer,
+            options,
             _phantom: PhantomData,
         })
     }
 
     /// Persists [Tx] to file(s) and calls [Tx::execute] on store data.
     /// Returns tx result
-    ///
-    /// Takes mutable reference to prevent some kind of deadlocks e.g.
-    /// committing tx, while holding still [QueryGuard] in one, single threaded function:
-    /// ```compile_fail
-    /// async fn request_handler(mut store: JsonStore<Counter, CounterTx>) -> StoreResult<()> {
-    ///     let read_locked = store.query().await; // immutable borrow occurs here
-    ///     store.commit(()).await // mutable borrow occurs here, compilation fails
-    ///                            // (cannot borrow `store` as mutable because it is also borrowed as immutable)
-    /// }
-    /// ```
-    /// However function, like rest of [Store], is thread safe.
     pub async fn commit<Q, R>(&mut self, tx_query: Q) -> StoreResult<R>
     where
         Q: Tx<D, R> + Into<T> + From<T>,
         S: Serializer<D> + Serializer<T>,
     {
-        let inner = &self.inner;
         let wrapped_tx: T = tx_query.into();
-        let serialized: Vec<u8> = inner
+        let serialized: Vec<u8> = self
             .serializer
             .serialize(&wrapped_tx)
             .map_err(|err| StoreError::EncodeJournalEntry(err.into()))?;
-        let mut persistent = inner.persistent.write().await;
-        let journal_file = persistent
-            .writable_journal(inner.options.max_journal_entries, &inner.serializer)
+        let journal_file = self
+            .persistent
+            .writable_journal(self.options.max_journal_entries, &self.serializer)
             .await?;
         journal_file
             .append(&serialized)
             .await
             .map_err(StoreError::JournalIO)?;
-        if let JournalFlushPolicy::EveryCommit = inner.options.journal_flush_policy {
+        if let JournalFlushPolicy::EveryCommit = self.options.journal_flush_policy {
             journal_file
                 .flush_and_sync()
                 .await
                 .map_err(StoreError::JournalIO)?;
         }
         let tx_query: Q = wrapped_tx.into();
-        let result = tx_query.execute(&mut persistent.data);
+        let result = tx_query.execute(&mut self.persistent.data);
         Ok(result)
     }
 
-    /// Returns immutable, read only store data.
-    /// While [QueryGuard] is not dropped, any store updates are locked.
-    pub async fn query(&self) -> QueryGuard<'_, D> {
-        QueryGuard(self.inner.persistent.read().await)
+    /// Returns current store data.
+    pub fn query(&self) -> &D {
+        &self.persistent.data
     }
 
     /// Flushes buffered transactions to file and synces it using [File::sync_data].
     pub async fn flush_and_sync(&mut self) -> StoreResult<()> {
-        self.inner
-            .persistent
-            .write()
-            .await
+        self.persistent
             .journal
             .flush_and_sync()
             .await
             .map_err(StoreError::JournalIO)
     }
-
-    fn start_flusher(interval: Duration, persistent: SharedPersistentData<D>) -> FlusherGuard
-    where
-        D: Sync + Send + 'static,
-        S: Serializer<T>,
-    {
-        FlusherGuard(tokio::spawn(async move {
-            loop {
-                sleep(interval).await;
-                let mut persistent = persistent.write().await;
-                if let Err(err) = persistent.journal.flush_and_sync().await {
-                    eprintln!("Could not flush journal log: {err:?}");
-                }
-            }
-        }))
-    }
-}
-
-struct StoreInner<D, S> {
-    persistent: SharedPersistentData<D>,
-    serializer: S,
-    options: StoreOptions,
-    _flusher_guard: Option<FlusherGuard>,
 }
 
 #[derive(Debug, Clone)]
@@ -228,23 +157,9 @@ impl Default for StoreOptions {
 pub enum JournalFlushPolicy {
     /// Slowest, but safest. Immediately saves transactions to file on [Store::commit].
     EveryCommit,
-    /// [Store] will own background task that will attempt to flush transactions every defined [Duration].
-    /// Transactions commited between flushes might be lost in case of crash.
-    /// Any flush errors are printed to stderr using [eprintln!].
-    Every(Duration),
     /// You are responsible for flushing data to file using [Store::flush_and_sync].
     Manually,
 }
-
-struct FlusherGuard(JoinHandle<Infallible>);
-
-impl Drop for FlusherGuard {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
-}
-
-type SharedPersistentData<D> = Arc<RwLock<PersistentData<D>>>;
 
 struct PersistentData<D> {
     data: D,
@@ -367,16 +282,6 @@ impl<T> Drop for PersistentData<T> {
                 };
             });
         }
-    }
-}
-
-pub struct QueryGuard<'a, T>(RwLockReadGuard<'a, PersistentData<T>>);
-
-impl<'a, T> Deref for QueryGuard<'a, T> {
-    type Target = T;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0.data
     }
 }
 
@@ -632,18 +537,12 @@ mod tests {
             Store::open(JsonSerializer, options, dir.path())
                 .await
                 .unwrap();
-        let first_ver = store.inner.persistent.read().await.next_snapshot_version;
+        let first_ver = store.persistent.next_snapshot_version;
         store.commit(IncreaseBy { by: 2115 }).await.unwrap();
         store.commit(Increase).await.unwrap();
-        assert_eq!(
-            store.inner.persistent.read().await.next_snapshot_version,
-            first_ver
-        );
+        assert_eq!(store.persistent.next_snapshot_version, first_ver);
         store.commit(Increase).await.unwrap();
-        assert_eq!(
-            store.inner.persistent.read().await.next_snapshot_version,
-            first_ver + 1
-        );
+        assert_eq!(store.persistent.next_snapshot_version, first_ver + 1);
     }
 
     #[tokio::test]
@@ -656,7 +555,7 @@ mod tests {
                     .await
                     .unwrap();
             store.commit(Increase).await.unwrap();
-            let ver = store.inner.persistent.read().await.next_snapshot_version;
+            let ver = store.persistent.next_snapshot_version;
             ver
         };
 
@@ -665,9 +564,6 @@ mod tests {
                 .await
                 .unwrap();
         store.commit(Increase).await.unwrap();
-        assert_eq!(
-            store.inner.persistent.read().await.next_snapshot_version,
-            first_ver
-        );
+        assert_eq!(store.persistent.next_snapshot_version, first_ver);
     }
 }

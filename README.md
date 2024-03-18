@@ -7,12 +7,12 @@
 
 ## Assumptions
 
-- All data lives in memory guarded with `tokio::sync::RwLock`, reads are fast and concurrent safe.
+- All data lives in memory.
 - By default every transaction is saved to append-only journal file and immediately [fsynced](https://man7.org/linux/man-pages/man2/fsync.2.html).
   By that, individual writes are slow, but they SHOULD survive crashes (e.g. power outage, software panic). \
-  However, you can set periodic sync or manual. See `JournalFlushPolicy` for more info.
-  Recommended for data that may be lost (e.g. cache, http session storage).
-- I don't guarantee durability, it's created for toy projects or non-relevant data like http authorization tokens/cookies. https://www.postgresql.org/docs/9.4/wal-reliability.html
+  However, you can set manual sync. See `JournalFlushPolicy` for more info.
+  Recommended for data that may be lost (e.g. cache).
+- I don't guarantee durability, it's created for toy projects or non-relevant data like cache.
 
 ## Features
 
@@ -24,12 +24,12 @@
 ## Resources
 
 - [Jaroslaw Ratajski - DROP DATABASE - galactic story](https://www.youtube.com/watch?v=m_uIROLGrN4)
+- https://www.postgresql.org/docs/9.4/wal-reliability.html
 - https://github.com/killertux/prevayler-rs
 
 ## Example
 
 ```rust
-
 type UserId = usize;
 type SessionsStore = JsonStore<Sessions, SessionsTx>;
 
@@ -85,7 +85,7 @@ async fn test_mem_commit() {
 
     let mut expected_tokens = HashMap::new();
     expected_tokens.insert(example_token.clone(), example_uid);
-    assert_eq!(store.query().await.tokens, expected_tokens);
+    assert_eq!(store.query().tokens, expected_tokens);
 
     let deleted_uid = store
         .commit(DeleteSession {

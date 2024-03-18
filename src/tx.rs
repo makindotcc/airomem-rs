@@ -5,9 +5,9 @@ pub trait Tx<D, R = ()> {
 /// Merges multiple [Tx] into one enum of [Tx] and
 /// implements [Into] and [From] traits required by [crate::Store] for
 /// merged tx (`$subtx`) variants (see [EnumBorrowOwned!]).
-/// 
+///
 /// For more details, please use cargo-expand or check macro's code.
-/// 
+///
 /// Store accepts only one [Tx] type, so to handle more than one [Tx] implementation,
 /// we need to wrap it like in following example:
 /// # Example
@@ -15,21 +15,21 @@ pub trait Tx<D, R = ()> {
 /// struct Counter {
 ///     count: usize,
 /// }
-/// 
+///
 /// airomem::MergeTx!(pub CounterTx<Counter> = IncreaseTx | DecreaseTx);
-/// 
+///
 /// #[derive(serde::Serialize, serde::Deserialize)]
 /// struct IncreaseTx;
-/// 
+///
 /// impl airomem::Tx<Counter> for IncreaseTx {
 ///     fn execute(self, data: &mut Counter) {
 ///         data.count += 1;
 ///     }
 /// }
-/// 
+///
 /// #[derive(serde::Serialize, serde::Deserialize)]
 /// struct DecreaseTx;
-/// 
+///
 /// impl airomem::Tx<Counter> for DecreaseTx {
 ///     fn execute(self, data: &mut Counter) {
 ///         data.count -= 1;
