@@ -143,7 +143,9 @@ where
         if persistent_data.is_none() {
             drop(persistent_data);
             let mut writable_persistent_data = self.inner.persistent.write().await;
-            *writable_persistent_data = Some(self.inner.load_persistent_data().await?);
+            if writable_persistent_data.is_none() {
+                *writable_persistent_data = Some(self.inner.load_persistent_data().await?);
+            }
             persistent_data = writable_persistent_data.downgrade();
         }
         Ok(QueryGuard(RwLockReadGuard::map(persistent_data, |p| {
