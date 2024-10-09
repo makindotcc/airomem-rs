@@ -24,6 +24,8 @@ pub enum StoreError {
     JournalInvalidFileName(Option<OsString>),
     #[error("state poisoned")]
     StatePoisoned,
+    #[error("Join task error")]
+    JoinError(tokio::task::JoinError),
 }
 
 impl<T> From<PoisonError<T>> for StoreError {
