@@ -13,6 +13,7 @@ use tokio::io::BufWriter;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::RwLock;
 use tokio::sync::RwLockReadGuard;
+use tokio::sync::RwLockWriteGuard;
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
 
@@ -34,12 +35,14 @@ pub type JsonStore<D, T> = Store<D, T, JsonSerializer>;
 /// So do not wrap it using [Arc] and [Mutex]/[RwLock]. Just [Clone] it.
 pub struct Store<D, T, S> {
     inner: Arc<StoreInner<D, T, S>>,
+    _flusher_guard: Option<Arc<FlusherGuard>>,
 }
 
 impl<D, T, S> Clone for Store<D, T, S> {
     fn clone(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
+            _flusher_guard: self._flusher_guard.as_ref().map(Arc::clone),
         }
     }
 }
@@ -47,8 +50,8 @@ impl<D, T, S> Clone for Store<D, T, S> {
 impl<D, T, S> Store<D, T, S>
 where
     D: Default + Send + Sync + 'static,
-    T: Tx<D>,
-    S: Serializer<D> + Serializer<T>,
+    T: Tx<D> + Send + Sync + 'static,
+    S: Serializer<D> + Serializer<T> + Send + Sync + 'static,
 {
     /// Restores [Store] state using files from given directory.
     /// If none, new store is created with [`<D>`] data [Default::default].
@@ -57,9 +60,22 @@ where
         options: StoreOptions,
         dir: impl Into<PathBuf>,
     ) -> StoreResult<Self> {
-        let inner = StoreInner::open(serializer, options, dir).await?;
+        let inner = Arc::new(StoreInner::open(serializer, options, dir).await?);
+        let _flusher_guard = match inner.options.journal_flush_policy {
+            JournalFlushPolicy::EveryCommit { .. } | JournalFlushPolicy::Manually => None,
+            JournalFlushPolicy::Every {
+                duration,
+                journal_flush_method,
+                ..
+            } => Some(Arc::new(Self::start_flusher(
+                duration,
+                journal_flush_method,
+                Arc::clone(&inner),
+            ))),
+        };
         Ok(Self {
-            inner: Arc::new(inner),
+            inner,
+            _flusher_guard,
         })
     }
 
@@ -82,54 +98,20 @@ where
     /// If function is canceled, store might execute transaction in background.
     pub async fn commit<Q, R>(&mut self, tx_query: Q) -> StoreResult<R>
     where
-        Q: Tx<D, R> + Into<T> + From<T>,
-        S: Send + Sync + 'static,
-        T: Send + Sync + 'static,
+        Q: Tx<D, R> + Into<T> + From<T> + Send,
         R: Send + 'static,
     {
         let inner = Arc::clone(&self.inner);
         let wrapped_tx: T = tx_query.into();
-        let serialized: Vec<u8> = inner
+        let serialized_wrapped_tx: Vec<u8> = inner
             .serializer
             .serialize(&wrapped_tx)
             .map_err(|err| StoreError::EncodeJournalEntry(err.into()))?;
         let result = tokio::spawn(async move {
-            let mut persistent_holder = inner.persistent.write().await;
-            let mut persistent_data = match persistent_holder.take() {
-                Some(persistent_data) => persistent_data,
-                None => {
-                    let reloaded_data = inner.load_persistent_data().await?;
-                    reloaded_data
-                }
-            };
-
-            let journal_file = persistent_data
-                .writable_journal(
-                    inner.options.max_journal_entries,
-                    &inner.serializer,
-                    &inner.dir,
-                )
-                .await?;
-
-            journal_file
-                .append(&serialized)
-                .await
-                .map_err(StoreError::JournalIO)?;
-            if let JournalFlushPolicy::EveryCommit {
-                journal_flush_method,
-                ..
-            } = inner.options.journal_flush_policy
-            {
-                journal_file
-                    .persist(journal_flush_method)
-                    .await
-                    .map_err(StoreError::JournalIO)?;
-            }
             let tx_query: Q = wrapped_tx.into();
-            let result = tx_query.execute(&mut persistent_data.data);
-
-            *persistent_holder = Some(persistent_data);
-            Ok::<R, StoreError>(result)
+            inner
+                .write_and_execute::<Q, R>(serialized_wrapped_tx, tx_query)
+                .await
         })
         .await
         .map_err(StoreError::JoinError)??;
@@ -139,18 +121,7 @@ where
     /// Returns immutable, read only store data.
     /// While [QueryGuard] is not dropped, any store updates are locked.
     pub async fn query(&self) -> StoreResult<QueryGuard<'_, D>> {
-        let mut persistent_data = self.inner.persistent.read().await;
-        if persistent_data.is_none() {
-            drop(persistent_data);
-            let mut writable_persistent_data = self.inner.persistent.write().await;
-            if writable_persistent_data.is_none() {
-                *writable_persistent_data = Some(self.inner.load_persistent_data().await?);
-            }
-            persistent_data = writable_persistent_data.downgrade();
-        }
-        Ok(QueryGuard(RwLockReadGuard::map(persistent_data, |p| {
-            p.as_ref().unwrap()
-        })))
+        Ok(QueryGuard(self.unpoisoned_persistent_data().await?))
     }
 
     /// Flushes buffered transactions to file. This method is faster than [Store::flush_and_sync], but
@@ -181,6 +152,42 @@ where
             None => Err(StoreError::StatePoisoned),
         }
     }
+
+    /// Tries to recover store data from file if it's poisoned (e.g. due to IO error on commit).
+    async fn unpoisoned_persistent_data(
+        &self,
+    ) -> StoreResult<RwLockReadGuard<'_, PersistentData<D>>> {
+        let mut persistent_data = self.inner.persistent.read().await;
+        if persistent_data.is_none() {
+            drop(persistent_data);
+            let mut writable_persistent_data = self.inner.persistent.write().await;
+            if writable_persistent_data.is_none() {
+                *writable_persistent_data = Some(self.inner.load_persistent_data().await?);
+            }
+            persistent_data = writable_persistent_data.downgrade();
+        }
+        Ok(RwLockReadGuard::map(persistent_data, |p| {
+            p.as_ref().unwrap()
+        }))
+    }
+
+    fn start_flusher(
+        interval: Duration,
+        journal_flush_method: JournalFlushMethod,
+        inner: Arc<StoreInner<D, T, S>>,
+    ) -> FlusherGuard {
+        FlusherGuard(tokio::spawn(async move {
+            loop {
+                sleep(interval).await;
+                let mut persistent = inner.persistent.write().await;
+                if let Some(persistent) = &mut *persistent {
+                    if let Err(err) = persistent.journal.persist(journal_flush_method).await {
+                        eprintln!("Could not flush journal log: {err:?}");
+                    }
+                }
+            }
+        }))
+    }
 }
 
 struct StoreInner<D, T, S> {
@@ -188,7 +195,6 @@ struct StoreInner<D, T, S> {
     serializer: S,
     options: StoreOptions,
     dir: PathBuf,
-    _flusher_guard: Option<FlusherGuard>,
     _phantom: PhantomData<T>,
 }
 
@@ -204,33 +210,15 @@ where
         dir: impl Into<PathBuf>,
     ) -> StoreResult<Self> {
         let dir: PathBuf = dir.into();
-        let persistent_data = PersistentData::load::<T, S>(
-            &dir,
-            options.can_flush_synchronously_on_drop(),
-            &serializer,
-        )
-        .await?;
-        let shared_persistent_data = Arc::new(RwLock::new(Some(persistent_data)));
-        let _flusher_guard = match options.journal_flush_policy {
-            JournalFlushPolicy::EveryCommit { .. } | JournalFlushPolicy::Manually => None,
-            JournalFlushPolicy::Every {
-                duration,
-                journal_flush_method,
-                ..
-            } => Some(Self::start_flusher(
-                duration,
-                journal_flush_method,
-                Arc::clone(&shared_persistent_data),
-            )),
-        };
-        Ok(Self {
-            persistent: shared_persistent_data,
+        let inner = Self {
+            persistent: Arc::new(RwLock::new(None)),
             serializer,
             options,
             dir,
-            _flusher_guard,
             _phantom: PhantomData,
-        })
+        };
+        *inner.persistent.write().await = Some(inner.load_persistent_data().await?);
+        Ok(inner)
     }
 
     async fn load_persistent_data(&self) -> StoreResult<PersistentData<D>> {
@@ -242,26 +230,56 @@ where
         .await
     }
 
-    fn start_flusher(
-        interval: Duration,
-        journal_flush_method: JournalFlushMethod,
-        persistent: SharedPersistentData<D>,
-    ) -> FlusherGuard
+    /// Poisons unpoisoned data or loads unpoisoned data from file.
+    /// Data must be put back to [RwLockWriteGuard] after successful commit - this way
+    /// store won't be in poisoned state.
+    async fn take_unpoisoned_data(
+        &self,
+    ) -> StoreResult<(
+        RwLockWriteGuard<'_, Option<PersistentData<D>>>,
+        PersistentData<D>,
+    )> {
+        let mut persistent_lock = self.persistent.write().await;
+        let persistent_data = match persistent_lock.take() {
+            Some(persistent_data) => persistent_data,
+            None => self.load_persistent_data().await?,
+        };
+        Ok((persistent_lock, persistent_data))
+    }
+
+    async fn write_and_execute<Q, R>(
+        &self,
+        serialized_wrapped_tx: Vec<u8>,
+        tx_query: Q,
+    ) -> StoreResult<R>
     where
-        D: Sync + Send + 'static,
-        S: Serializer<T>,
+        Q: Tx<D, R>,
     {
-        FlusherGuard(tokio::spawn(async move {
-            loop {
-                sleep(interval).await;
-                let mut persistent = persistent.write().await;
-                if let Some(persistent) = &mut *persistent {
-                    if let Err(err) = persistent.journal.persist(journal_flush_method).await {
-                        eprintln!("Could not flush journal log: {err:?}");
-                    }
-                }
-            }
-        }))
+        let (mut persistent_lock, mut persistent_data) = self.take_unpoisoned_data().await?;
+        let journal_file = persistent_data
+            .writable_journal(
+                self.options.max_journal_entries,
+                &self.serializer,
+                &self.dir,
+            )
+            .await?;
+        journal_file
+            .append(&serialized_wrapped_tx)
+            .await
+            .map_err(StoreError::JournalIO)?;
+        if let JournalFlushPolicy::EveryCommit {
+            journal_flush_method,
+            ..
+        } = self.options.journal_flush_policy
+        {
+            journal_file
+                .persist(journal_flush_method)
+                .await
+                .map_err(StoreError::JournalIO)?;
+        }
+        let result = tx_query.execute(&mut persistent_data.data);
+        *persistent_lock = Some(persistent_data);
+        Ok(result)
     }
 }
 
@@ -354,7 +372,12 @@ impl Drop for FlusherGuard {
     }
 }
 
-type SharedPersistentData<D> = Arc<RwLock<Option<PersistentData<D>>>>;
+/// Holds persistent data in two states:
+/// - [Option::Some] - data is not poisoned and can be used.
+/// - [Option::None] - data is poisoned and must be recovered from file to achieve consistency.
+type PoisonablePersistentData<D> = Option<PersistentData<D>>;
+
+type SharedPersistentData<D> = Arc<RwLock<PoisonablePersistentData<D>>>;
 
 struct PersistentData<D> {
     data: D,
