@@ -58,7 +58,7 @@ async fn test_mem_commit() {
 
     let mut expected_tokens = HashMap::new();
     expected_tokens.insert(example_token.clone(), example_uid);
-    assert_eq!(store.query().await.tokens, expected_tokens);
+    assert_eq!(store.query().await.unwrap().tokens, expected_tokens);
 
     let deleted_uid = store
         .commit(DeleteSession {
@@ -97,7 +97,7 @@ async fn test_manual_flush() {
             .await
             .unwrap();
         assert_eq!(
-            store.query().await.tokens.len(),
+            store.query().await.unwrap().tokens.len(),
             0,
             "flushed journal log on drop, but it shouldn't"
         );
@@ -114,7 +114,7 @@ async fn test_manual_flush() {
             .await
             .unwrap();
         assert_eq!(
-            store.query().await.tokens.len(),
+            store.query().await.unwrap().tokens.len(),
             1,
             "should flush journal log on drop"
         );
@@ -146,7 +146,7 @@ async fn test_journal_rebuild() {
         it.insert("token1".to_string(), 1);
         it
     };
-    assert_eq!(store.query().await.tokens, expected_tokens);
+    assert_eq!(store.query().await.unwrap().tokens, expected_tokens);
 }
 
 #[tokio::test]
@@ -179,7 +179,7 @@ async fn test_rebuild_with_snapshot() {
             it
         };
         let state = store.query().await;
-        assert_eq!(state.tokens, expected_tokens);
-        assert_eq!(state.operations, commits);
+        assert_eq!(state.as_ref().unwrap().tokens, expected_tokens);
+        assert_eq!(state.unwrap().operations, commits);
     }
 }

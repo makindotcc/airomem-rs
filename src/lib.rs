@@ -44,19 +44,19 @@ impl<D, T, S> Clone for Store<D, T, S> {
     }
 }
 
-impl<D, T, S> Store<D, T, S> {
+impl<D, T, S> Store<D, T, S>
+where
+    D: Default + Send + Sync + 'static,
+    T: Tx<D>,
+    S: Serializer<D> + Serializer<T>,
+{
     /// Restores [Store] state using files from given directory.
     /// If none, new store is created with [`<D>`] data [Default::default].
     pub async fn open(
         serializer: S,
         options: StoreOptions,
         dir: impl Into<PathBuf>,
-    ) -> StoreResult<Self>
-    where
-        D: Default + Send + Sync + 'static,
-        T: Tx<D>,
-        S: Serializer<D> + Serializer<T>,
-    {
+    ) -> StoreResult<Self> {
         let inner = StoreInner::open(serializer, options, dir).await?;
         Ok(Self {
             inner: Arc::new(inner),
@@ -79,9 +79,7 @@ impl<D, T, S> Store<D, T, S> {
     pub async fn commit<Q, R>(&mut self, tx_query: Q) -> StoreResult<R>
     where
         Q: Tx<D, R> + Into<T> + From<T>,
-        S: Serializer<D> + Serializer<T> + Send,
-        D: Send + Sync + 'static,
-        S: Sync + 'static,
+        S: Send + Sync + 'static,
         T: Send + Sync + 'static,
         R: Send + 'static,
     {
@@ -92,10 +90,23 @@ impl<D, T, S> Store<D, T, S> {
             .serialize(&wrapped_tx)
             .map_err(|err| StoreError::EncodeJournalEntry(err.into()))?;
         let result = tokio::spawn(async move {
-            let mut persistent = inner.persistent.write().await;
-            let journal_file = persistent
-                .writable_journal(inner.options.max_journal_entries, &inner.serializer)
+            let mut persistent_holder = inner.persistent.write().await;
+            let mut persistent_data = match persistent_holder.take() {
+                Some(persistent_data) => persistent_data,
+                None => {
+                    let reloaded_data = inner.load_persistent_data().await?;
+                    reloaded_data
+                }
+            };
+
+            let journal_file = persistent_data
+                .writable_journal(
+                    inner.options.max_journal_entries,
+                    &inner.serializer,
+                    &inner.dir,
+                )
                 .await?;
+
             journal_file
                 .append(&serialized)
                 .await
@@ -107,7 +118,9 @@ impl<D, T, S> Store<D, T, S> {
                     .map_err(StoreError::JournalIO)?;
             }
             let tx_query: Q = wrapped_tx.into();
-            let result = tx_query.execute(&mut persistent.data);
+            let result = tx_query.execute(&mut persistent_data.data);
+
+            *persistent_holder = Some(persistent_data);
             Ok::<R, StoreError>(result)
         })
         .await
@@ -117,20 +130,30 @@ impl<D, T, S> Store<D, T, S> {
 
     /// Returns immutable, read only store data.
     /// While [QueryGuard] is not dropped, any store updates are locked.
-    pub async fn query(&self) -> QueryGuard<'_, D> {
-        QueryGuard(self.inner.persistent.read().await)
+    pub async fn query(&self) -> StoreResult<QueryGuard<'_, D>> {
+        let mut persistent_data = self.inner.persistent.read().await;
+        if persistent_data.is_none() {
+            drop(persistent_data);
+            let mut writable_persistent_data = self.inner.persistent.write().await;
+            *writable_persistent_data = Some(self.inner.load_persistent_data().await?);
+            persistent_data = writable_persistent_data.downgrade();
+        }
+        Ok(QueryGuard(RwLockReadGuard::map(persistent_data, |p| {
+            p.as_ref().unwrap()
+        })))
     }
 
     /// Flushes buffered transactions to file and synces it using [File::sync_data].
     pub async fn flush_and_sync(&mut self) -> StoreResult<()> {
-        self.inner
-            .persistent
-            .write()
-            .await
-            .journal
-            .flush_and_sync()
-            .await
-            .map_err(StoreError::JournalIO)
+        let mut persistent = self.inner.persistent.write().await;
+        match &mut *persistent {
+            Some(persistent) => persistent
+                .journal
+                .flush_and_sync()
+                .await
+                .map_err(StoreError::JournalIO),
+            None => Err(StoreError::StatePoisoned),
+        }
     }
 }
 
@@ -138,57 +161,54 @@ struct StoreInner<D, T, S> {
     persistent: SharedPersistentData<D>,
     serializer: S,
     options: StoreOptions,
+    dir: PathBuf,
     _flusher_guard: Option<FlusherGuard>,
     _phantom: PhantomData<T>,
 }
 
-impl<T, D, S> StoreInner<D, T, S> {
+impl<T, D, S> StoreInner<D, T, S>
+where
+    D: Default + Send + Sync + 'static,
+    S: Serializer<D> + Serializer<T>,
+    T: Tx<D>,
+{
     pub async fn open(
         serializer: S,
         options: StoreOptions,
         dir: impl Into<PathBuf>,
-    ) -> StoreResult<Self>
-    where
-        D: Default + Send + Sync + 'static,
-        T: Tx<D>,
-        S: Serializer<D> + Serializer<T>,
-    {
+    ) -> StoreResult<Self> {
         let dir: PathBuf = dir.into();
-        fs::create_dir_all(&dir).await.map_err(StoreError::FileIO)?;
-        let persistence_actions = PersistenceAction::rebuild(&dir).await?;
-        let next_snapshot_version: SnapshotVersion = persistence_actions
-            .last()
-            .map(|action| match action {
-                PersistenceAction::Snapshot { version, .. } => *version + 1,
-                PersistenceAction::Journal { version, .. } => *version,
-            })
-            .unwrap_or_default();
-        let persistent = Arc::new(RwLock::new({
-            let flush_on_drop = options.flush_synchronously_on_drop
-                && !matches!(
-                    options.journal_flush_policy,
-                    JournalFlushPolicy::EveryCommit
-                );
-            let mut persistent =
-                PersistentData::new(dir, next_snapshot_version, flush_on_drop).await?;
-            persistent
-                .rebuild::<T, S>(&serializer, persistence_actions)
-                .await?;
-            persistent
-        }));
+        let persistent_data = PersistentData::load::<T, S>(
+            &dir,
+            options.can_flush_synchronously_on_drop(),
+            &serializer,
+        )
+        .await?;
+        let shared_persistent_data = Arc::new(RwLock::new(Some(persistent_data)));
         let _flusher_guard = match options.journal_flush_policy {
             JournalFlushPolicy::EveryCommit | JournalFlushPolicy::Manually => None,
-            JournalFlushPolicy::Every(interval) => {
-                Some(Self::start_flusher(interval, Arc::clone(&persistent)))
-            }
+            JournalFlushPolicy::Every(interval) => Some(Self::start_flusher(
+                interval,
+                Arc::clone(&shared_persistent_data),
+            )),
         };
         Ok(Self {
-            persistent,
+            persistent: shared_persistent_data,
             serializer,
             options,
+            dir,
             _flusher_guard,
             _phantom: PhantomData,
         })
+    }
+
+    async fn load_persistent_data(&self) -> StoreResult<PersistentData<D>> {
+        PersistentData::load::<T, S>(
+            &self.dir,
+            self.options.can_flush_synchronously_on_drop(),
+            &self.serializer,
+        )
+        .await
     }
 
     fn start_flusher(interval: Duration, persistent: SharedPersistentData<D>) -> FlusherGuard
@@ -200,8 +220,10 @@ impl<T, D, S> StoreInner<D, T, S> {
             loop {
                 sleep(interval).await;
                 let mut persistent = persistent.write().await;
-                if let Err(err) = persistent.journal.flush_and_sync().await {
-                    eprintln!("Could not flush journal log: {err:?}");
+                if let Some(persistent) = &mut *persistent {
+                    if let Err(err) = persistent.journal.flush_and_sync().await {
+                        eprintln!("Could not flush journal log: {err:?}");
+                    }
                 }
             }
         }))
@@ -234,6 +256,11 @@ impl StoreOptions {
     pub fn flush_synchronously_on_drop(mut self, value: bool) -> Self {
         self.flush_synchronously_on_drop = value;
         self
+    }
+
+    fn can_flush_synchronously_on_drop(&self) -> bool {
+        self.flush_synchronously_on_drop
+            && !matches!(self.journal_flush_policy, JournalFlushPolicy::EveryCommit)
     }
 }
 
@@ -268,32 +295,41 @@ impl Drop for FlusherGuard {
     }
 }
 
-type SharedPersistentData<D> = Arc<RwLock<PersistentData<D>>>;
+type SharedPersistentData<D> = Arc<RwLock<Option<PersistentData<D>>>>;
 
 struct PersistentData<D> {
     data: D,
-    dir: PathBuf,
     next_snapshot_version: SnapshotVersion,
     journal: JournalFile,
     flush_on_drop: bool,
 }
 
 impl<D> PersistentData<D> {
-    async fn new(
-        dir: PathBuf,
-        next_snapshot_version: SnapshotVersion,
-        flush_on_drop: bool,
-    ) -> StoreResult<Self>
+    pub async fn load<T, S>(dir: &Path, flush_on_drop: bool, serializer: &S) -> StoreResult<Self>
     where
+        T: Tx<D>,
+        S: Serializer<D> + Serializer<T>,
         D: Default,
     {
-        Ok(Self {
+        fs::create_dir_all(dir).await.map_err(StoreError::FileIO)?;
+        let persistence_actions = PersistenceAction::rebuild(dir).await?;
+        let next_snapshot_version: SnapshotVersion = persistence_actions
+            .last()
+            .map(|action| match action {
+                PersistenceAction::Snapshot { version, .. } => *version + 1,
+                PersistenceAction::Journal { version, .. } => *version,
+            })
+            .unwrap_or_default();
+        let mut persistent = Self {
             data: Default::default(),
-            journal: JournalFile::open(&dir, next_snapshot_version).await?,
-            dir,
+            journal: JournalFile::open(dir, next_snapshot_version).await?,
             next_snapshot_version,
             flush_on_drop,
-        })
+        };
+        persistent
+            .rebuild::<T, S>(&serializer, persistence_actions)
+            .await?;
+        Ok(persistent)
     }
 
     async fn rebuild<T, S>(
@@ -332,17 +368,18 @@ impl<D> PersistentData<D> {
         &mut self,
         max_entries: NonZeroUsize,
         serializer: &S,
+        dir: &Path,
     ) -> StoreResult<&mut JournalFile>
     where
         S: Serializer<D>,
     {
         if self.journal.written_entries >= max_entries.into() {
-            self.create_new_journal(serializer).await?;
+            self.create_new_journal(serializer, dir).await?;
         }
         Ok(&mut self.journal)
     }
 
-    async fn create_new_journal<S>(&mut self, serializer: &S) -> StoreResult<()>
+    async fn create_new_journal<S>(&mut self, serializer: &S, dir: &Path) -> StoreResult<()>
     where
         S: Serializer<D>,
     {
@@ -350,14 +387,14 @@ impl<D> PersistentData<D> {
             .flush_and_sync()
             .await
             .map_err(StoreError::JournalIO)?;
-        self.snapshot(serializer).await?;
-        self.journal = JournalFile::open(self.dir.clone(), self.next_snapshot_version).await?;
+        self.snapshot(serializer, dir).await?;
+        self.journal = JournalFile::open(dir, self.next_snapshot_version).await?;
         Ok(())
     }
 
     /// Writes fully serialized data to snapshot file.
     /// From now, in case of recovery, it has priority over journal file with same [SnapshotVersion].
-    async fn snapshot<S>(&mut self, serializer: &S) -> StoreResult<()>
+    async fn snapshot<S>(&mut self, serializer: &S, dir: &Path) -> StoreResult<()>
     where
         S: Serializer<D>,
     {
@@ -367,10 +404,7 @@ impl<D> PersistentData<D> {
         let mut file = fs::OpenOptions::new()
             .create(true)
             .write(true)
-            .open(
-                self.dir
-                    .join(format!("{:0>10}.snapshot", self.next_snapshot_version)),
-            )
+            .open(dir.join(format!("{:0>10}.snapshot", self.next_snapshot_version)))
             .await
             .map_err(StoreError::SnapshotIO)?;
         file.write_all(&serialized)
@@ -642,18 +676,12 @@ mod tests {
             Store::open(JsonSerializer, options, dir.path())
                 .await
                 .unwrap();
-        let first_ver = store.inner.persistent.read().await.next_snapshot_version;
+        let first_ver = get_snapshot_version(&store).await;
         store.commit(IncreaseBy { by: 2115 }).await.unwrap();
         store.commit(Increase).await.unwrap();
-        assert_eq!(
-            store.inner.persistent.read().await.next_snapshot_version,
-            first_ver
-        );
+        assert_eq!(get_snapshot_version(&store).await, first_ver);
         store.commit(Increase).await.unwrap();
-        assert_eq!(
-            store.inner.persistent.read().await.next_snapshot_version,
-            first_ver + 1
-        );
+        assert_eq!(get_snapshot_version(&store).await, first_ver + 1);
     }
 
     #[tokio::test]
@@ -666,8 +694,7 @@ mod tests {
                     .await
                     .unwrap();
             store.commit(Increase).await.unwrap();
-            let ver = store.inner.persistent.read().await.next_snapshot_version;
-            ver
+            get_snapshot_version(&store).await
         };
 
         let mut store: JsonStore<Counter, CounterTx> =
@@ -675,9 +702,17 @@ mod tests {
                 .await
                 .unwrap();
         store.commit(Increase).await.unwrap();
-        assert_eq!(
-            store.inner.persistent.read().await.next_snapshot_version,
-            first_ver
-        );
+        assert_eq!(get_snapshot_version(&store).await, first_ver);
+    }
+
+    async fn get_snapshot_version(store: &JsonStore<Counter, CounterTx>) -> u32 {
+        store
+            .inner
+            .persistent
+            .read()
+            .await
+            .as_ref()
+            .unwrap()
+            .next_snapshot_version
     }
 }
