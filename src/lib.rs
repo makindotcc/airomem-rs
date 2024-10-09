@@ -76,6 +76,10 @@ where
     /// }
     /// ```
     /// However function, like rest of [Store], is thread safe.
+    ///
+    /// # Cancelation safety
+    /// Function is cancel safe in meaning store state won't be corrupted after cancelation.
+    /// If function is canceled, store might execute transaction in background.
     pub async fn commit<Q, R>(&mut self, tx_query: Q) -> StoreResult<R>
     where
         Q: Tx<D, R> + Into<T> + From<T>,
