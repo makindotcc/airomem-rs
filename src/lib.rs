@@ -684,13 +684,7 @@ where
         let mut deserializer = serde_json::Deserializer::from_reader(reader);
         match serde::de::Deserialize::deserialize(&mut deserializer) {
             Ok(data) => Ok(data),
-            Err(err) if err.is_eof() => {
-                // ignore partially saved entry, but
-                // is eof always equal to interrupted write?
-                // todo:
-                // return error for half-written transaction and give option to api to handle it
-                Ok(None)
-            }
+            Err(err) if err.is_eof() && err.column() == 0 => Ok(None),
             Err(err) => Err(err),
         }
     }
