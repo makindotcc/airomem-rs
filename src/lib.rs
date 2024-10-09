@@ -17,7 +17,7 @@ pub type JsonStore<D, T> = Store<D, T, JsonSerializer>;
 
 /// [Store] is implementation of system prevalence.
 pub struct Store<D, T, S> {
-    persistent: PersistentData<D>,
+    persistent: Option<PersistentData<D>>,
     serializer: S,
     options: StoreOptions,
     _phantom: PhantomData<T>,
@@ -60,7 +60,7 @@ impl<D, T, S> Store<D, T, S> {
             persistent
         };
         Ok(Self {
-            persistent,
+            persistent: Some(persistent),
             serializer,
             options,
             _phantom: PhantomData,
@@ -79,33 +79,50 @@ impl<D, T, S> Store<D, T, S> {
             .serializer
             .serialize(&wrapped_tx)
             .map_err(|err| StoreError::EncodeJournalEntry(err.into()))?;
-        let journal_file = self
-            .persistent
-            .writable_journal(self.options.max_journal_entries, &self.serializer)
+
+        // take out persistent data (set state to temporarly unavailable) and
+        // put in back after all failable IO operations are executed.
+        // We don't know in which state IO can break - maybe it partially wrote data to file - then we must
+        // rebuild state from files.
+        let mut persistent = self.persistent.take().ok_or(StoreError::StatePoisoned)?;
+        persistent
+            .ensure_journal_is_writable(self.options.max_journal_entries, &self.serializer)
             .await?;
-        journal_file
-            .append(&serialized)
-            .await
-            .map_err(StoreError::JournalIO)?;
-        if let JournalFlushPolicy::EveryCommit = self.options.journal_flush_policy {
+
+        let tx_query: Q = wrapped_tx.into();
+        let result = tx_query.execute(&mut persistent.data);
+
+        {
+            let journal_file = &mut persistent.journal;
             journal_file
-                .flush_and_sync()
+                .append(&serialized)
                 .await
                 .map_err(StoreError::JournalIO)?;
+            if let JournalFlushPolicy::EveryCommit = self.options.journal_flush_policy {
+                journal_file
+                    .flush_and_sync()
+                    .await
+                    .map_err(StoreError::JournalIO)?;
+            }
         }
-        let tx_query: Q = wrapped_tx.into();
-        let result = tx_query.execute(&mut self.persistent.data);
+
+        self.persistent = Some(persistent);
         Ok(result)
     }
 
     /// Returns current store data.
-    pub fn query(&self) -> &D {
-        &self.persistent.data
+    pub fn query(&self) -> StoreResult<&D> {
+        self.persistent
+            .as_ref()
+            .map(|persistent| &persistent.data)
+            .ok_or(StoreError::StatePoisoned)
     }
 
     /// Flushes buffered transactions to file and synces it using [File::sync_data].
     pub async fn flush_and_sync(&mut self) -> StoreResult<()> {
         self.persistent
+            .as_mut()
+            .ok_or(StoreError::StatePoisoned)?
             .journal
             .flush_and_sync()
             .await
@@ -219,18 +236,18 @@ impl<D> PersistentData<D> {
         Ok(())
     }
 
-    async fn writable_journal<S>(
+    async fn ensure_journal_is_writable<S>(
         &mut self,
         max_entries: NonZeroUsize,
         serializer: &S,
-    ) -> StoreResult<&mut JournalFile>
+    ) -> StoreResult<()>
     where
         S: Serializer<D>,
     {
-        if self.journal.written_entries >= max_entries.into() || self.journal.writer.is_none() {
+        if self.journal.written_entries >= max_entries.into() {
             self.create_new_journal(serializer).await?;
         }
-        Ok(&mut self.journal)
+        Ok(())
     }
 
     async fn create_new_journal<S>(&mut self, serializer: &S) -> StoreResult<()>
@@ -289,7 +306,7 @@ type SnapshotVersion = u32;
 
 #[derive(Debug)]
 struct JournalFile {
-    writer: Option<BufWriter<File>>,
+    writer: BufWriter<File>,
     written_entries: usize,
 }
 
@@ -303,34 +320,20 @@ impl JournalFile {
             .await
             .map_err(StoreError::JournalIO)?;
         Ok(Self {
-            writer: Some(BufWriter::new(file)),
+            writer: BufWriter::new(file),
             written_entries: 0,
         })
     }
 
     async fn append(&mut self, transaction: &[u8]) -> std::io::Result<()> {
-        let writer = match &mut self.writer {
-            Some(writer) => writer,
-            None => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "file poisoned",
-                ))
-            }
-        };
-        if let Err(err) = writer.write_all(transaction).await {
-            self.writer = None;
-            return Err(err);
-        }
+        self.writer.write_all(transaction).await?;
         self.written_entries += 1;
         Ok(())
     }
 
     async fn flush_and_sync(&mut self) -> std::io::Result<()> {
-        if let Some(writer) = &mut self.writer {
-            writer.flush().await?;
-            writer.get_mut().sync_data().await?;
-        }
+        self.writer.flush().await?;
+        self.writer.get_mut().sync_data().await?;
         Ok(())
     }
 
@@ -537,12 +540,18 @@ mod tests {
             Store::open(JsonSerializer, options, dir.path())
                 .await
                 .unwrap();
-        let first_ver = store.persistent.next_snapshot_version;
+        let first_ver = store.persistent.as_ref().unwrap().next_snapshot_version;
         store.commit(IncreaseBy { by: 2115 }).await.unwrap();
         store.commit(Increase).await.unwrap();
-        assert_eq!(store.persistent.next_snapshot_version, first_ver);
+        assert_eq!(
+            store.persistent.as_ref().unwrap().next_snapshot_version,
+            first_ver
+        );
         store.commit(Increase).await.unwrap();
-        assert_eq!(store.persistent.next_snapshot_version, first_ver + 1);
+        assert_eq!(
+            store.persistent.as_ref().unwrap().next_snapshot_version,
+            first_ver + 1
+        );
     }
 
     #[tokio::test]
@@ -555,7 +564,7 @@ mod tests {
                     .await
                     .unwrap();
             store.commit(Increase).await.unwrap();
-            let ver = store.persistent.next_snapshot_version;
+            let ver = store.persistent.unwrap().next_snapshot_version;
             ver
         };
 
@@ -564,6 +573,6 @@ mod tests {
                 .await
                 .unwrap();
         store.commit(Increase).await.unwrap();
-        assert_eq!(store.persistent.next_snapshot_version, first_ver);
+        assert_eq!(store.persistent.unwrap().next_snapshot_version, first_ver);
     }
 }
