@@ -115,9 +115,13 @@ where
                 .append(&serialized)
                 .await
                 .map_err(StoreError::JournalIO)?;
-            if let JournalFlushPolicy::EveryCommit = inner.options.journal_flush_policy {
+            if let JournalFlushPolicy::EveryCommit {
+                journal_flush_method,
+                ..
+            } = inner.options.journal_flush_policy
+            {
                 journal_file
-                    .flush_and_sync()
+                    .persist(journal_flush_method)
                     .await
                     .map_err(StoreError::JournalIO)?;
             }
@@ -145,6 +149,18 @@ where
         Ok(QueryGuard(RwLockReadGuard::map(persistent_data, |p| {
             p.as_ref().unwrap()
         })))
+    }
+
+    pub async fn flush(&mut self) -> StoreResult<()> {
+        let mut persistent = self.inner.persistent.write().await;
+        match &mut *persistent {
+            Some(persistent) => persistent
+                .journal
+                .flush()
+                .await
+                .map_err(StoreError::JournalIO),
+            None => Err(StoreError::StatePoisoned),
+        }
     }
 
     /// Flushes buffered transactions to file and synces it using [File::sync_data].
@@ -190,9 +206,14 @@ where
         .await?;
         let shared_persistent_data = Arc::new(RwLock::new(Some(persistent_data)));
         let _flusher_guard = match options.journal_flush_policy {
-            JournalFlushPolicy::EveryCommit | JournalFlushPolicy::Manually => None,
-            JournalFlushPolicy::Every(interval) => Some(Self::start_flusher(
-                interval,
+            JournalFlushPolicy::EveryCommit { .. } | JournalFlushPolicy::Manually => None,
+            JournalFlushPolicy::Every {
+                duration,
+                journal_flush_method,
+                ..
+            } => Some(Self::start_flusher(
+                duration,
+                journal_flush_method,
                 Arc::clone(&shared_persistent_data),
             )),
         };
@@ -215,7 +236,11 @@ where
         .await
     }
 
-    fn start_flusher(interval: Duration, persistent: SharedPersistentData<D>) -> FlusherGuard
+    fn start_flusher(
+        interval: Duration,
+        journal_flush_method: JournalFlushMethod,
+        persistent: SharedPersistentData<D>,
+    ) -> FlusherGuard
     where
         D: Sync + Send + 'static,
         S: Serializer<T>,
@@ -225,7 +250,7 @@ where
                 sleep(interval).await;
                 let mut persistent = persistent.write().await;
                 if let Some(persistent) = &mut *persistent {
-                    if let Err(err) = persistent.journal.flush_and_sync().await {
+                    if let Err(err) = persistent.journal.persist(journal_flush_method).await {
                         eprintln!("Could not flush journal log: {err:?}");
                     }
                 }
@@ -264,7 +289,12 @@ impl StoreOptions {
 
     fn can_flush_synchronously_on_drop(&self) -> bool {
         self.flush_synchronously_on_drop
-            && !matches!(self.journal_flush_policy, JournalFlushPolicy::EveryCommit)
+            && !matches!(
+                self.journal_flush_policy,
+                JournalFlushPolicy::EveryCommit {
+                    journal_flush_method: JournalFlushMethod::FlushAndSync
+                }
+            )
     }
 }
 
@@ -272,7 +302,9 @@ impl Default for StoreOptions {
     fn default() -> Self {
         Self {
             max_journal_entries: NonZeroUsize::new(65535).unwrap(),
-            journal_flush_policy: JournalFlushPolicy::EveryCommit,
+            journal_flush_policy: JournalFlushPolicy::EveryCommit {
+                journal_flush_method: JournalFlushMethod::FlushAndSync,
+            },
             flush_synchronously_on_drop: true,
         }
     }
@@ -282,13 +314,30 @@ impl Default for StoreOptions {
 #[derive(Debug, Clone, Copy)]
 pub enum JournalFlushPolicy {
     /// Slowest, but safest. Immediately saves transactions to file on [Store::commit].
-    EveryCommit,
+    EveryCommit {
+        /// Decides how [Store] should flush transactions to file.
+        /// Read [JournalFlushMethod] for more info.
+        journal_flush_method: JournalFlushMethod,
+    },
     /// [Store] will own background task that will attempt to flush transactions every defined [Duration].
     /// Transactions commited between flushes might be lost in case of crash.
-    /// Any flush errors are printed to stderr using [eprintln!].
-    Every(Duration),
+    /// Any flush errors are printed to stderr using [eprintln!] so not really
+    /// recommended for other things than cache that can be lost on restart.
+    Every {
+        duration: Duration,
+        journal_flush_method: JournalFlushMethod,
+    },
     /// You are responsible for flushing data to file using [Store::flush_and_sync].
     Manually,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum JournalFlushMethod {
+    /// Flushes and syncs data to file. Slowest, but most durable.
+    /// Sync means fdatasync on Unix systems - read more in [man page](https://man7.org/linux/man-pages/man2/fsync.2.html).
+    FlushAndSync,
+    /// Flushes data to file. Faster, but less durable in case of system crash.
+    Flush,
 }
 
 struct FlusherGuard(JoinHandle<Infallible>);
@@ -471,10 +520,23 @@ impl JournalFile {
         Ok(())
     }
 
+    async fn flush(&mut self) -> std::io::Result<()> {
+        self.writer.flush().await
+    }
+
     async fn flush_and_sync(&mut self) -> std::io::Result<()> {
-        self.writer.flush().await?;
-        self.writer.get_mut().sync_data().await?;
-        Ok(())
+        self.flush().await?;
+        self.writer.get_mut().sync_data().await
+    }
+
+    async fn persist(&mut self, flush_method: JournalFlushMethod) -> std::io::Result<()> {
+        match flush_method {
+            JournalFlushMethod::FlushAndSync => {
+                self.flush().await?;
+                self.writer.get_mut().sync_data().await
+            }
+            JournalFlushMethod::Flush => self.flush().await,
+        }
     }
 
     async fn parse<T, S>(serializer: &S, file: &mut File) -> StoreResult<Vec<T>>
