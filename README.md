@@ -29,7 +29,6 @@
 ## Example
 
 ```rust
-
 type UserId = usize;
 type SessionsStore = JsonStore<Sessions, SessionsTx>;
 
@@ -85,7 +84,7 @@ async fn test_mem_commit() {
 
     let mut expected_tokens = HashMap::new();
     expected_tokens.insert(example_token.clone(), example_uid);
-    assert_eq!(store.query().await.tokens, expected_tokens);
+    assert_eq!(store.query().await.unwrap().tokens, expected_tokens);
 
     let deleted_uid = store
         .commit(DeleteSession {
