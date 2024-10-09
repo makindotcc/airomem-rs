@@ -153,6 +153,9 @@ where
         })))
     }
 
+    /// Flushes buffered transactions to file. This method is faster than [Store::flush_and_sync], but
+    /// less durable (in case of system crash you have higher chance of losing data).
+    /// Use [Store::flush_and_sync] for stricter durability.
     pub async fn flush(&mut self) -> StoreResult<()> {
         let mut persistent = self.inner.persistent.write().await;
         match &mut *persistent {
@@ -166,6 +169,7 @@ where
     }
 
     /// Flushes buffered transactions to file and synces it using [File::sync_data].
+    /// This method is way slower than [Store::flush], but is more durable.
     pub async fn flush_and_sync(&mut self) -> StoreResult<()> {
         let mut persistent = self.inner.persistent.write().await;
         match &mut *persistent {
